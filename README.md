@@ -1,4 +1,7 @@
 # Faber
+[![npm](https://img.shields.io/npm/v/faberwright)](https://www.npmjs.com/package/faberwright)
+[![license](https://img.shields.io/npm/l/faberwright)](./LICENSE)
+[![node](https://img.shields.io/node/v/faberwright)](https://nodejs.org)
 
 **An agentic AI coding assistant for your terminal.** Give it a task in plain English; it explores your repository, edits files with your approval, runs your tests, and remembers your project across sessions.
 
