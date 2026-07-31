@@ -1,0 +1,12 @@
+node_modules/
+dist/
+dist-test/
+.faber/
+.codewright/
+.env
+.env.*
+!.env.example
+.DS_Store
+*.log
+*.tgz
+selftest-report.txt
