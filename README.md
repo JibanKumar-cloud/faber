@@ -60,7 +60,7 @@ Faber is Codewright renamed (the npm name was taken between build and release). 
 Node.js ≥ 22.5 (uses built-in `node:sqlite` — **zero native dependencies**; installs never fail on compilation). Two pure-JS runtime deps: `diff`, `picocolors`.
 
 ```bash
-npm install -g faber
+npm install -g faberwright
 export ANTHROPIC_API_KEY=sk-ant-...       # add to ~/.zshrc to persist
 faber                                     # you're in
 ```

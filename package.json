@@ -1,5 +1,5 @@
 {
-  "name": "faber",
+  "name": "faberwright",
   "version": "0.3.0",
   "description": "Faber: an agentic AI coding assistant for your terminal — streams, edits with diff approval, runs your tests, and remembers your project across sessions.",
   "type": "module",
@@ -8,8 +8,8 @@
     "node": ">=22.5"
   },
   "bin": {
-    "faber": "./dist/index.js",
-    "fb": "./dist/index.js"
+    "faber": "dist/index.js",
+    "fb": "dist/index.js"
   },
   "files": [
     "dist",
@@ -45,5 +45,13 @@
     "developer-tools",
     "terminal",
     "llm"
-  ]
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/JibanKumar-cloud/faber.git"
+  },
+  "homepage": "https://github.com/JibanKumar-cloud/faber#readme",
+  "bugs": {
+    "url": "https://github.com/JibanKumar-cloud/faber/issues"
+  }
 }
