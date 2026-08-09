@@ -466,6 +466,9 @@ test("git: previously-committed state dir triggers TRACKED warning", () => {
   run("git init -q && git config user.email t@t.co && git config user.name t");
   fs.mkdirSync(path.join(cfg.workspace, ".codewright"), { recursive: true });
   fs.writeFileSync(path.join(cfg.workspace, ".codewright", "oops.db"), "x");
-  run("git add -A && git commit -qm 'accidentally committed state'");
+  // Double quotes, not single: Windows cmd treats ' literally, so a
+  // single-quoted message splits into separate arguments and git reports
+  // "pathspec 'committed' did not match any file(s)".
+  run('git add -A && git commit -qm "accidentally committed state"');
   assert.equal(ensureStateIgnored(cfg.workspace), "TRACKED");
 });
