@@ -7,6 +7,9 @@
  */
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { loadSettings, activeProfile, type Profile } from "./settings.js";
+import { getRoute, resolveModel, baseUrlFor, ROUTES } from "./routes.js";
+import { resolveCredential, getCredential } from "./credentials.js";
 
 export interface Config {
   workspace: string;
@@ -28,6 +31,13 @@ export interface Config {
   indexDb: string;
   sessionsDir: string;
   usageDb: string;
+  route: string;                      // which route owns this session
+  region: string | undefined;
+  modelPins: Record<string, string>;  // alias -> real id (cloud/local routes)
+  profileName: string;
+  priceIn: number | undefined;
+  autoRefreshPrices: boolean;
+  priceOut: number | undefined;
 }
 
 export const DEFAULT_ANTHROPIC_MODEL = "claude-sonnet-4-5";
@@ -63,16 +73,46 @@ export function loadConfig(workspace?: string): Config {
   const s = (k: string): string | undefined =>
     typeof fileCfg[k] === "string" ? (fileCfg[k] as string) : undefined;
 
-  const provider = (process.env.CW_PROVIDER ?? s("provider") ?? "anthropic").toLowerCase() as Config["provider"];
+  // Global profile sits below project config and above defaults.
+  const settings = loadSettings();
+  const prof: Profile = activeProfile(settings);
+  const route = getRoute(process.env.FABER_ROUTE ?? s("route") ?? prof.route) ?? ROUTES[0]!;
+  const pins = { ...(prof.modelPins ?? {}), ...((fileCfg["modelPins"] as Record<string, string>) ?? {}) };
+
+  // The route decides the wire format unless a provider is set explicitly.
+  const provider = (process.env.CW_PROVIDER ?? s("provider") ?? route.wire).toLowerCase() as Config["provider"];
   const anthropic = provider === "anthropic";
+  const rawModel = process.env.CW_MODEL ?? s("model") ?? prof.model
+    ?? (anthropic ? DEFAULT_ANTHROPIC_MODEL : DEFAULT_OPENAI_MODEL);
+  // Env var first, then the 0600 credential store — unless the profile says
+  // the stored key was chosen deliberately, in which case honour that.
+  const keyFromProfile = prof.apiKeyEnv
+    ? (prof.preferStoredKey
+        ? (getCredential(prof.apiKeyEnv) ?? resolveCredential(prof.apiKeyEnv))
+        : resolveCredential(prof.apiKeyEnv))
+    : undefined;
+  const region = process.env.FABER_REGION ?? s("region") ?? prof.region;
+  const routeUrl = baseUrlFor(route, region);
+  // A route-specific credential (e.g. BEDROCK_API_KEY) wins over the generic one.
+  const routeKey = route.keyEnv
+    ? (prof.preferStoredKey ? (getCredential(route.keyEnv) ?? resolveCredential(route.keyEnv))
+                            : resolveCredential(route.keyEnv))
+    : undefined;
   return {
     workspace: ws,
     stateDir,
     provider,
-    model: process.env.CW_MODEL ?? s("model") ?? (anthropic ? DEFAULT_ANTHROPIC_MODEL : DEFAULT_OPENAI_MODEL),
-    baseUrl: process.env.CW_BASE_URL ?? s("baseUrl") ?? (anthropic ? "https://api.anthropic.com" : "https://api.openai.com/v1"),
-    apiKey: anthropic ? (process.env.ANTHROPIC_API_KEY ?? s("apiKey")) : (process.env.OPENAI_API_KEY ?? s("apiKey")),
-    weakModel: process.env.CW_WEAK_MODEL ?? s("weakModel"),
+    model: resolveModel(rawModel, route, pins),
+    baseUrl: process.env.CW_BASE_URL ?? s("baseUrl") ?? prof.baseUrl ?? routeUrl
+      ?? (anthropic ? "https://api.anthropic.com" : "https://api.openai.com/v1"),
+    // A route that names its own credential (BEDROCK_API_KEY) must NOT fall
+    // back to the generic one: sending an Anthropic key to Bedrock produces a
+    // confusing 401 and hides the fact that AWS signing was available.
+    apiKey: routeKey ?? keyFromProfile ?? s("apiKey")
+      ?? (route.keyEnv
+            ? undefined
+            : resolveCredential(anthropic ? "ANTHROPIC_API_KEY" : "OPENAI_API_KEY")),
+    weakModel: process.env.CW_WEAK_MODEL ?? s("weakModel") ?? prof.weakModel,
     maxTokens: 4096,
     maxIterations: Number(process.env.CW_MAX_ITERATIONS ?? fileCfg["maxIterations"] ?? 40),
     contextTokenBudget: Number(process.env.CW_CONTEXT_BUDGET ?? fileCfg["contextTokenBudget"] ?? 60_000),
@@ -85,5 +125,16 @@ export function loadConfig(workspace?: string): Config {
     indexDb: path.join(stateDir, "index.db"),
     sessionsDir: path.join(stateDir, "sessions"),
     usageDb: path.join(stateDir, "usage.db"),
+    route: route.id,
+    region,
+    modelPins: pins,
+    profileName: settings.activeProfile,
+    priceIn: Number(process.env.FABER_PRICE_IN) || prof.priceIn,
+    // On by default: costs are frozen per task, so silently stale prices would
+    // corrupt history permanently. Opt out with FABER_AUTO_PRICES=0.
+    autoRefreshPrices: process.env.FABER_AUTO_PRICES === "0" ? false
+      : process.env.FABER_AUTO_PRICES === "1" ? true
+      : prof.autoRefreshPrices !== false,
+    priceOut: Number(process.env.FABER_PRICE_OUT) || prof.priceOut,
   };
 }

@@ -5,6 +5,7 @@
  * see text as it is generated, and AbortSignal cancels mid-stream.
  */
 import type { Config } from "./config.js";
+import { signRequest, discoverAwsCredentials, type AwsCredentials } from "./sigv4.js";
 import { FatalError, TransientAPIError, withRetries, CancelledError } from "./errors.js";
 
 export type ContentBlock =
@@ -33,13 +34,89 @@ export interface LLMResponse {
 
 const RETRYABLE = new Set([408, 409, 429, 500, 502, 503, 504, 529]);
 
+/** AWS credentials discovered once per process for SigV4 routes. */
+let awsCredsPromise: Promise<AwsCredentials | undefined> | undefined;
+
 export class LLMClient {
   constructor(private config: Config) {
+    // Local servers (Ollama, LM Studio, vLLM on localhost) accept any bearer
+    // token, so requiring a key there would block the one route that is free.
+    const isLocal = /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:|\/|$)/.test(config.baseUrl);
+    // Routes that sign with AWS credentials need no API key at all — in
+    // SageMaker Studio, ECS or Lambda the execution role supplies them.
+    if (!config.apiKey && config.route === "bedrock") return;
+    if (!config.apiKey && isLocal) {
+      this.config = { ...config, apiKey: "local" };
+      return;
+    }
     if (!config.apiKey) {
       const v = config.provider === "anthropic" ? "ANTHROPIC_API_KEY" : "OPENAI_API_KEY";
-      throw new FatalError(`No API key found. Set ${v} or add it to .faber/config.json.`);
+      throw new FatalError(
+        `No API key found. Set ${v}, or run /route to pick a local model that doesn't need one.`,
+      );
     }
   }
+
+  /**
+   * Ask the provider which models this credential can actually use.
+   * Anthropic: GET /v1/models  -> { data: [{ id, display_name }] }, newest first.
+   * OpenAI-compatible (incl. Bedrock mantle, Ollama): GET /models, same shape
+   * minus display_name. Returns [] on any failure — this is a convenience,
+   * never a blocker, so an offline or restricted key just falls back.
+   */
+  async listModels(signal?: AbortSignal): Promise<{ id: string; name?: string }[]> {
+    const anthropic = this.config.provider === "anthropic";
+    const url = anthropic
+      ? `${this.config.baseUrl}/v1/models?limit=100`
+      : `${this.config.baseUrl}/models`;
+    const headers: Record<string, string> = anthropic
+      ? { "x-api-key": this.config.apiKey!, "anthropic-version": "2023-06-01" }
+      : { authorization: `Bearer ${this.config.apiKey}` };
+    try {
+      const ctl = new AbortController();
+      const timer = setTimeout(() => ctl.abort(), 6000);
+      signal?.addEventListener("abort", () => ctl.abort(), { once: true });
+      const res = await fetch(url, { headers, signal: ctl.signal });
+      clearTimeout(timer);
+      if (!res.ok) return [];
+      const body = await res.json() as { data?: { id?: string; display_name?: string }[] };
+      return (body.data ?? [])
+        .filter((m): m is { id: string; display_name?: string } => typeof m.id === "string")
+        .map((m) => ({ id: m.id, name: m.display_name }));
+    } catch {
+      return [];   // offline, no permission, or an endpoint without the route
+    }
+  }
+
+  /**
+   * Auth for one request. An API key is a header; AWS credentials mean signing
+   * the whole request, which is how an IAM role authenticates with no key.
+   */
+  private async authHeaders(url: string, body: string): Promise<Record<string, string>> {
+    if (this.config.apiKey) return { "x-api-key": this.config.apiKey };
+    if (this.config.route !== "bedrock") return {};
+    awsCredsPromise ??= discoverAwsCredentials();
+    const creds = await awsCredsPromise;
+    if (!creds) {
+      throw new FatalError(
+        "No AWS credentials found for the Bedrock route. Set BEDROCK_API_KEY, " +
+        "or run in an environment with an IAM role (SageMaker, ECS, EC2) " +
+        "or `aws configure`.",
+      );
+    }
+    return signRequest({
+      method: "POST",
+      url,
+      body,
+      region: this.config.region ?? "us-east-1",
+      service: "bedrock",
+      credentials: creds,
+      headers: { "content-type": "application/json" },
+    });
+  }
+
+  /** Switch model at runtime (/model). Cache prefixes are per-model. */
+  setModel(id: string): void { this.config = { ...this.config, model: id }; }
 
   complete(
     system: string,
@@ -98,8 +175,10 @@ export class LLMClient {
     };
     if (tools.length) body.tools = cachedTools;
 
-    const res = await this.post(`${this.config.baseUrl}/v1/messages`, {
-      "x-api-key": this.config.apiKey!,
+    const url = `${this.config.baseUrl}/v1/messages`;
+    const authHeaders = await this.authHeaders(url, JSON.stringify(body));
+    const res = await this.post(url, {
+      ...authHeaders,
       "anthropic-version": "2023-06-01",
       "content-type": "application/json",
     }, body, signal);

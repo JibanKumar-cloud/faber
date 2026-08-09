@@ -33,6 +33,13 @@ function tmpConfig(): Config {
     indexDb: path.join(stateDir, "index.db"),
     sessionsDir: path.join(stateDir, "sessions"),
     usageDb: path.join(stateDir, "usage.db"),
+    route: "anthropic-api",
+    region: undefined,
+    modelPins: {},
+    profileName: "default",
+    priceIn: undefined,
+    priceOut: undefined,
+    autoRefreshPrices: false,
   };
 }
 
@@ -138,7 +145,10 @@ test("shell: denylist blocks, exit code reported, timeout enforced", async () =>
   const out = await sh.run("echo hello && exit 3");
   assert.match(out, /hello/);
   assert.match(out, /exit code: 3/);
-  await assert.rejects(sh.run("sleep 5", 300), ToolError);
+  // `sleep` doesn't exist on Windows cmd, where it would fail instantly
+  // instead of timing out. node is guaranteed present on every platform.
+  const stall = `node -e "setTimeout(()=>{},5000)"`;
+  await assert.rejects(sh.run(stall, 300), ToolError);
 });
 
 test("registry: validates input, rejection message on denied approval", async () => {

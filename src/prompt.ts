@@ -13,7 +13,7 @@ let guardFn: ((on: boolean) => void) | undefined;
 /** Wired by the CLI: pauses the composed-input pipe while the selector owns stdin. */
 export function setSelectGuard(fn: (on: boolean) => void): void { guardFn = fn; }
 
-export async function select(
+async function selectRaw(
   rl: readline.Interface,
   question: string,
   options: string[],
@@ -21,9 +21,16 @@ export async function select(
 ): Promise<number> {
   if (!process.stdin.isTTY || !process.stdout.isTTY) {
     const menu = options.map((o, i) => `  ${i + 1}) ${o}`).join("\n");
-    const ans = (await rl.question(
-      `${question}\n${menu}\nChoose [1-${options.length}] (default ${defaultIndex + 1}): `,
-    )).trim();
+    let ans: string;
+    try {
+      ans = (await rl.question(
+        `${question}\n${menu}\nChoose [1-${options.length}] (default ${defaultIndex + 1}): `,
+      )).trim();
+    } catch {
+      // stdin closed mid-prompt (piped input ran out, or Ctrl-D):
+      // take the default rather than surfacing a readline stack trace.
+      return defaultIndex;
+    }
     const n = Number.parseInt(ans, 10);
     return Number.isInteger(n) && n >= 1 && n <= options.length ? n - 1 : defaultIndex;
   }
@@ -71,6 +78,9 @@ export async function select(
         else if (key === "\x1b[B" || key === "j") { idx = (idx + 1) % options.length; render(); }
         else if (key >= "1" && key <= "9" && Number(key) <= options.length) { idx = Number(key) - 1; render(); finish(idx); done = true; }
         else if (key === "\r" || key === "\n") { finish(idx); done = true; }
+        // Ctrl-C or Esc cancels. Returning -1 used to leak out as an array
+        // index, crashing the caller with "cannot read properties of
+        // undefined" — a cancel must be a clean exit, not a bad index.
         else if (key === "\x03" || key === "\x1b") { finish(-1); done = true; }
       }
     };
@@ -78,4 +88,74 @@ export async function select(
     render();
     stdin.on("data", onData);
   });
+}
+
+
+/**
+ * Read a secret without echoing it. A pasted API key that appears on screen
+ * survives in terminal scrollback, `script` logs, and screen recordings — so
+ * the characters are consumed in raw mode and only a masked length is shown.
+ * Falls back to a normal read when there's no TTY (CI piping a key in).
+ */
+export async function readSecret(
+  rl: readline.Interface,
+  promptText: string,
+  io?: { stdin?: NodeJS.ReadStream; stdout?: NodeJS.WriteStream },
+): Promise<string> {
+  const stdin = io?.stdin ?? process.stdin;
+  const stdout = io?.stdout ?? process.stdout;
+  if (!stdin.isTTY || !stdout.isTTY) {
+    return (await rl.question(promptText)).trim();
+  }
+  guardFn?.(true);
+  rl.pause();
+  const wasRaw = stdin.isRaw ?? false;
+  stdin.setRawMode(true);
+  stdin.resume();
+  stdout.write(promptText);
+
+  return new Promise<string>((resolve) => {
+    let value = "";
+    const done = (): void => {
+      stdin.removeListener("data", onData);
+      stdin.setRawMode(wasRaw);
+      guardFn?.(false);
+      rl.resume();
+      stdout.write("\n");
+      resolve(value.trim());
+    };
+    const onData = (buf: Buffer): void => {
+      for (const ch of buf.toString("utf8")) {
+        if (ch === "\r" || ch === "\n") return done();
+        if (ch === "\x03") { value = ""; return done(); }        // Ctrl-C
+        if (ch === "\x7f" || ch === "\b") {                      // backspace
+          if (value.length) { value = value.slice(0, -1); stdout.write("\b \b"); }
+          continue;
+        }
+        if (ch >= " ") { value += ch; stdout.write("•"); }
+      }
+    };
+    stdin.on("data", onData);
+  });
+}
+
+
+/**
+ * Arrow-key menu. Cancelling (Ctrl-C or Esc) exits the process cleanly rather
+ * than returning a sentinel index that every caller would have to check —
+ * one forgotten check produced a raw TypeError mid-setup.
+ */
+export async function select(
+  rl: readline.Interface,
+  question: string,
+  options: string[],
+  defaultIndex = 0,
+): Promise<number> {
+  const picked = await selectRaw(rl, question, options, defaultIndex);
+  if (picked < 0 || picked >= options.length) {
+    process.stdout.write("\n");
+    rl.close();
+    process.exit(130);        // 128 + SIGINT, the conventional cancel code
+  }
+  return picked;
 }

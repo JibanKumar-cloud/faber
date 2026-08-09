@@ -66,6 +66,9 @@ Output discipline (IMPORTANT):
 export class Agent {
   /** Verbose mode: user asked for full-depth explanations (/verbose). */
   verbose = false;
+  /** Active model. Switching mid-session invalidates the prompt cache, since
+   *  cached prefixes are per-model — the next task pays full price once. */
+  model: string;
   /** Mid-task steering: lines typed while the agent works, injected at the
    *  next loop boundary so the model course-corrects without cancelling. */
   private steerQueue: string[] = [];
@@ -86,6 +89,7 @@ export class Agent {
     resumeSessionId?: string,
     askUser?: AskUserFn,
   ) {
+    this.model = config.model;
     this.llm = new LLMClient(config);
     this.usage = new UsageLedger(config.usageDb, config.workspace);
     this.checkpoints = new CheckpointManager(config.stateDir, config.workspace);
@@ -100,6 +104,11 @@ export class Agent {
       this.shortTerm.messages = restored;
       if (restored.length) this.events.onInfo?.(`Resumed session ${resumeSessionId} (${restored.length} messages).`);
     }
+  }
+
+  setModel(id: string): void {
+    this.model = id;
+    this.llm.setModel(id);
   }
 
   steer(text: string): void {
@@ -228,7 +237,7 @@ export class Agent {
     } finally {
       this.checkpoints.commit();
       if (total.calls > 0) {
-        this.usage.record(total, this.config.model);
+        this.usage.record(total, this.model, { in: this.config.priceIn, out: this.config.priceOut });
         this.events.onUsage?.(total);
       }
     }

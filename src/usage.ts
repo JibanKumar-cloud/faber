@@ -9,15 +9,27 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { priceFor, cacheReadPrice, cacheWritePrice, PRICES_AS_OF, readPriceCache, priceAgeDays, STALE_AFTER_DAYS, type ModelPrice } from "./pricing.js";
 
 export interface TaskUsage {
   input: number; cacheRead: number; cacheWrite: number; output: number; calls: number;
 }
 export interface UsageTotals extends TaskUsage { tasks: number; }
 
+/** What was actually charged, as recorded at the time each task ran. */
+export interface BilledTotals {
+  cost: number | null;      // sum of stored per-task costs
+  saved: number | null;
+  unpriced: number;         // tasks recorded before prices were known
+}
+
 export class UsageLedger {
   private db: DatabaseSync;
   session: UsageTotals = { input: 0, cacheRead: 0, cacheWrite: 0, output: 0, calls: 0, tasks: 0 };
+  /** Model used by the most recent task. */
+  currentModel = "";
+  /** When this process started, so the session row can be priced per model. */
+  private readonly sessionStart = Date.now();
 
   constructor(dbPath: string, private projectPath: string) {
     this.db = new DatabaseSync(dbPath);
@@ -25,12 +37,27 @@ export class UsageLedger {
     this.db.exec(`CREATE TABLE IF NOT EXISTS tasks (
       ts INTEGER, input INTEGER, cache_read INTEGER, cache_write INTEGER,
       output INTEGER, calls INTEGER, model TEXT)`);
+    // Cost is recorded when the task runs, at the prices in effect then.
+    // Prices change; money already spent does not. Ledgers created before this
+    // column existed keep NULL and are priced at display time as a fallback.
+    for (const col of ["cost REAL", "saved REAL"]) {
+      try { this.db.exec(`ALTER TABLE tasks ADD COLUMN ${col}`); }
+      catch { /* already migrated */ }
+    }
     this.registerProject();
   }
 
-  record(u: TaskUsage, model: string): void {
-    this.db.prepare("INSERT INTO tasks VALUES (?, ?, ?, ?, ?, ?, ?)")
-      .run(Date.now(), u.input, u.cacheRead, u.cacheWrite, u.output, u.calls, model);
+  /**
+   * Record a completed task. Cost is computed and stored NOW, using the prices
+   * in effect at this moment — later price changes never rewrite it.
+   */
+  record(u: TaskUsage, model: string, override?: { in?: number; out?: number }): void {
+    this.currentModel = model;
+    const p = priceFor(model, override);
+    const cost = UsageLedger.cost(u, p) ?? null;
+    const saved = UsageLedger.saved(u, p) ?? null;
+    this.db.prepare("INSERT INTO tasks VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
+      .run(Date.now(), u.input, u.cacheRead, u.cacheWrite, u.output, u.calls, model, cost, saved);
     this.session.input += u.input; this.session.cacheRead += u.cacheRead;
     this.session.cacheWrite += u.cacheWrite; this.session.output += u.output;
     this.session.calls += u.calls; this.session.tasks += 1;
@@ -45,17 +72,42 @@ export class UsageLedger {
     ).get(sinceMs ?? 0) as unknown as UsageTotals;
   }
 
-  /** Cost in USD; undefined when CW_PRICE_IN/OUT aren't configured. */
-  static cost(u: TaskUsage, priceIn?: number, priceOut?: number): number | undefined {
-    if (!priceIn || !priceOut) return undefined;
-    return (u.input * priceIn + u.cacheRead * priceIn * 0.1 +
-            u.cacheWrite * priceIn * 1.25 + u.output * priceOut) / 1e6;
+  /** Cost in USD for one usage record at a given model's prices. */
+  static cost(u: TaskUsage, p?: ModelPrice): number | undefined {
+    if (!p) return undefined;
+    return (u.input * p.in + u.cacheRead * cacheReadPrice(p) +
+            u.cacheWrite * cacheWritePrice(p) + u.output * p.out) / 1e6;
   }
 
-  /** Net savings from caching vs paying full input price (reads at 0.1x minus write premium). */
-  static saved(u: TaskUsage, priceIn?: number): number | undefined {
-    if (!priceIn) return undefined;
-    return (u.cacheRead * priceIn * 0.9 - u.cacheWrite * priceIn * 0.25) / 1e6;
+  /** What caching saved vs paying full input price, net of the write premium. */
+  static saved(u: TaskUsage, p?: ModelPrice): number | undefined {
+    if (!p) return undefined;
+    const readSaving = u.cacheRead * (p.in - cacheReadPrice(p));
+    const writePremium = u.cacheWrite * (cacheWritePrice(p) - p.in);
+    return (readSaving - writePremium) / 1e6;
+  }
+
+  /**
+   * Totals split by model, so a history spanning several models is priced with
+   * each model's own rates rather than whatever is loaded right now.
+   */
+  get startedAt(): number { return this.sessionStart; }
+
+  totalsByModel(sinceMs?: number): { model: string; totals: UsageTotals; billed: BilledTotals }[] {
+    const rows = this.db.prepare(
+      `SELECT model, COUNT(*) tasks, COALESCE(SUM(input),0) input,
+              COALESCE(SUM(cache_read),0) cacheRead, COALESCE(SUM(cache_write),0) cacheWrite,
+              COALESCE(SUM(output),0) output, COALESCE(SUM(calls),0) calls,
+              SUM(cost) billedCost, SUM(saved) billedSaved,
+              SUM(CASE WHEN cost IS NULL THEN 1 ELSE 0 END) unpriced
+       FROM tasks WHERE ts >= ? GROUP BY model`,
+    ).all(sinceMs ?? 0) as unknown as
+      (UsageTotals & { model: string; billedCost: number | null; billedSaved: number | null; unpriced: number })[];
+    return rows.map((r) => ({
+      model: r.model,
+      totals: r,
+      billed: { cost: r.billedCost, saved: r.billedSaved, unpriced: r.unpriced },
+    }));
   }
 
   // ---- global registry so usage can be summed across every project ----
@@ -106,33 +158,82 @@ const k = (n: number): string => n >= 1_000_000 ? (n / 1_000_000).toFixed(1) + "
   : n >= 1000 ? (n / 1000).toFixed(1) + "k" : String(n);
 const money = (v: number | undefined): string => v === undefined ? "—" : `$${v.toFixed(2)}`;
 
-/** Render the /usage stats panel. */
+/**
+ * Render the /usage panel. Each row is priced per model using that model's own
+ * rates, so a history that spans a switch from Sonnet to Opus stays accurate.
+ */
 export function renderUsagePanel(
-  ledger: UsageLedger, priceIn?: number, priceOut?: number,
+  ledger: UsageLedger,
+  override?: { in?: number; out?: number },
 ): string {
   const midnight = new Date(); midnight.setHours(0, 0, 0, 0);
-  const rows: [string, UsageTotals][] = [
-    ["this session", ledger.session],
-    ["today", ledger.totals(midnight.getTime())],
-    ["all time", ledger.totals()],
+  const windows: [string, number | undefined][] = [
+    ["this session", undefined],
+    ["today", midnight.getTime()],
+    ["all time", 0],
   ];
+
   const lines: string[] = [];
   const W = [13, 7, 12, 9, 7, 9, 9];
   const cells = (c: string[]): string => c.map((s, i) => s.padEnd(W[i]!)).join(" ");
   lines.push(cells(["", "tasks", "in", "cached", "out", "cost", "saved"]));
-  for (const [label, t] of rows) {
-    const totalIn = t.input + t.cacheRead + t.cacheWrite;
-    const pct = totalIn > 0 ? Math.round((t.cacheRead / totalIn) * 100) + "%" : "0%";
-    lines.push(cells([
-      label, String(t.tasks), k(totalIn), pct, k(t.output),
-      money(UsageLedger.cost(t, priceIn, priceOut)),
-      money(UsageLedger.saved(t, priceIn)),
-    ]));
+
+  let anyPriced = false;
+  let legacyRows = 0;
+  let estimated = false;
+  for (const [label, since] of windows) {
+    // session totals come from memory; the rest are priced per model from disk
+    // Every window is priced per model — including the session, which would
+    // otherwise apply the last-used model's rates to earlier tasks.
+    const bands = ledger.totalsByModel(since ?? ledger.startedAt);
+    const agg: UsageTotals = { input: 0, cacheRead: 0, cacheWrite: 0, output: 0, calls: 0, tasks: 0 };
+    let cost: number | undefined;
+    let saved: number | undefined;
+    for (const b of bands) {
+      agg.input += b.totals.input; agg.cacheRead += b.totals.cacheRead;
+      agg.cacheWrite += b.totals.cacheWrite; agg.output += b.totals.output;
+      agg.calls += b.totals.calls; agg.tasks += b.totals.tasks;
+      // Historical cost is whatever was charged at the time — never repriced.
+      if (b.billed.cost !== null) { cost = (cost ?? 0) + b.billed.cost; anyPriced = true; }
+      if (b.billed.saved !== null) saved = (saved ?? 0) + b.billed.saved;
+      if (b.billed.unpriced > 0) {
+        // Rows recorded before costs were stored have nothing to preserve, so
+        // estimate them at today's prices and flag the row as an estimate.
+        legacyRows += b.billed.unpriced;
+        const p = priceFor(b.model, override);
+        const c = UsageLedger.cost(b.totals, p);
+        const s = UsageLedger.saved(b.totals, p);
+        if (c !== undefined) { cost = (cost ?? 0) + c; anyPriced = true; estimated = true; }
+        if (s !== undefined) saved = (saved ?? 0) + s;
+      }
+    }
+    const totalIn = agg.input + agg.cacheRead + agg.cacheWrite;
+    const pct = totalIn > 0 ? Math.round((agg.cacheRead / totalIn) * 100) + "%" : "0%";
+    lines.push(cells([label, String(agg.tasks), k(totalIn), pct, k(agg.output),
+                      money(cost), money(saved)]));
   }
-  if (!priceIn || !priceOut) {
+
+  if (anyPriced) {
+    const src = readPriceCache();
     lines.push("");
-    lines.push("set CW_PRICE_IN and CW_PRICE_OUT ($/Mtok) to see cost and savings");
+    lines.push("cost is what each task was charged when it ran — later price changes don't rewrite it");
+    const age = priceAgeDays();
+    if (src && age !== undefined) {
+      const when = new Date(src.fetchedAt).toISOString().slice(0, 10);
+      lines.push(age > STALE_AFTER_DAYS
+        ? `new tasks priced from rates fetched ${when} (${Math.round(age)} days ago — consider /usage --refresh-prices)`
+        : `new tasks priced from rates fetched ${when}`);
+    } else {
+      lines.push(`new tasks priced from built-in rates, as of ${PRICES_AS_OF} — /usage --refresh-prices for current`);
+    }
+    if (legacyRows) {
+      lines.push(`${legacyRows} older task(s) predate cost tracking${estimated ? " — estimated at today's rates" : ""}`);
+    }
+  } else {
+    lines.push("");
+    lines.push("no price known for this model — set FABER_PRICE_IN / FABER_PRICE_OUT");
   }
+
   const others = UsageLedger.allProjects().filter((p) => p.totals.tasks > 0);
   if (others.length > 1) {
     lines.push("");
@@ -142,7 +243,7 @@ export function renderUsagePanel(
       lines.push(cells([
         "  " + path.basename(project).slice(0, 11), String(t.tasks), k(totalIn),
         totalIn > 0 ? Math.round((t.cacheRead / totalIn) * 100) + "%" : "0%",
-        k(t.output), money(UsageLedger.cost(t, priceIn, priceOut)), "",
+        k(t.output), "", "",
       ]));
     }
   }

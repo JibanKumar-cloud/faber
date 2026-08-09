@@ -34,12 +34,21 @@ import { Agent } from "./agent.js";
 import { FatalError, CancelledError } from "./errors.js";
 import { SessionStore } from "./memory/sessions.js";
 import { isRepo, isDirty, ensureStateIgnored } from "./git.js";
-import { select, setSelectGuard } from "./prompt.js";
+import { select, setSelectGuard, readSecret } from "./prompt.js";
 import { createComposedInput, restore, describeComposed } from "./input.js";
 import { Composer } from "./editor.js";
 import { StatusLine } from "./status.js";
 import { renderMarkdown, StreamRenderer } from "./markdown.js";
-import { renderUsagePanel } from "./usage.js";
+import { renderUsagePanel, UsageLedger } from "./usage.js";
+import { ROUTES, getRoute, modelsForRoute, describeModel, resolveModel, vendors, baseUrlFor, DEFAULT_REGION } from "./routes.js";
+import { loadSettings, saveSettings, updateActive, activeProfile, settingsPath } from "./settings.js";
+import { needsOnboarding, interactive, runOnboarding, reportSetup, setupComplete, ensureCredential } from "./onboard.js";
+import {
+  saveCredential, deleteCredential, listCredentialNames, getCredential,
+  maskCredential, credentialsPath, permissionsAreLoose, resolveCredential, looksLikeKey,
+} from "./credentials.js";
+import { readCache, writeCache, clearCache, buildPicker } from "./models.js";
+import { refreshPrices, priceFor, pricesAreStale, shouldAutoRefresh, priceAgeDays, STALE_AFTER_DAYS } from "./pricing.js";
 import type { PendingWrite } from "./tools/fs.js";
 
 /** Version comes from package.json — one source of truth for banner and --version. */
@@ -137,14 +146,51 @@ async function main(): Promise<void> {
       const totalIn = u.input + u.cacheRead + u.cacheWrite;
       const cachePct = totalIn > 0 ? Math.round((u.cacheRead / totalIn) * 100) : 0;
       let line = `tokens: ${k(totalIn)} in (${cachePct}% cached) / ${k(u.output)} out · ${u.calls} call${u.calls === 1 ? "" : "s"}`;
-      const pIn = Number(process.env.CW_PRICE_IN), pOut = Number(process.env.CW_PRICE_OUT);
-      if (pIn > 0 && pOut > 0) { // $/Mtok: cache reads ~0.1x, cache writes ~1.25x
-        const usd = (u.input * pIn + u.cacheRead * pIn * 0.1 + u.cacheWrite * pIn * 1.25 + u.output * pOut) / 1e6;
-        line += ` · ~$${usd.toFixed(3)}`;
-      }
+      const usd = UsageLedger.cost(u, priceFor(agent.model, { in: config.priceIn, out: config.priceOut }));
+      if (usd !== undefined) line += ` · ~$${usd.toFixed(3)}`;
       console.log(pc.dim(line));
     },
   };
+
+  // Setup must be verified BEFORE the agent is built: the LLM client throws
+  // on a missing key, which would pre-empt the guided fix with a raw error.
+  // Every launch checks that setup is COMPLETE, not merely that a settings
+  // file exists. What counts depends on the route, so a Bedrock profile with
+  // an IAM role passes while an Anthropic profile with no key does not —
+  // and the gap is fixed here rather than surfacing as a 401 mid-task.
+  if (needsOnboarding() && interactive()) {
+    console.log(pc.cyan(`Faber v${VERSION}`));
+    const setup = await runOnboarding(rl, { first: true });
+    reportSetup(setup);
+    // Aborted setup saved nothing, so there is no model to reach — exit here
+    // rather than letting the LLM client throw a less useful error.
+    if (setup.aborted) { rl.close(); process.exitCode = 1; return; }
+    config = loadConfig(config.workspace);
+  } else {
+    const state = await setupComplete(config);
+    if (!state.complete) {
+      if (!interactive()) {
+        console.error(pc.red(`Setup isn't finished — ${state.missing}.`));
+        console.error(pc.dim(`  Run faber interactively to complete setup, or: ${state.fix}`));
+        rl.close(); process.exitCode = 1; return;
+      }
+      // Start over from the top rather than resuming at the missing step:
+      // someone without a key for this route usually wants a DIFFERENT route,
+      // and resuming would trap them on the one that just failed.
+      console.log(pc.cyan(`Faber v${VERSION}`));
+      console.log(pc.yellow(`Setup isn't finished — ${state.missing}. Starting over.`));
+      const setup = await runOnboarding(rl, { first: true });
+      reportSetup(setup);
+      if (setup.aborted) { rl.close(); process.exitCode = 1; return; }
+      config = loadConfig(config.workspace);
+      const after = await setupComplete(config);
+      if (!after.complete) {
+        console.log(pc.yellow(`Setup still incomplete — ${after.missing}.`));
+        console.log(pc.dim(`  ${after.fix}, then run faber again.`));
+        rl.close(); process.exitCode = 1; return;
+      }
+    }
+  }
 
   const resumeId = flags.has("--resume") ? SessionStore.latestId(config.sessionsDir) : undefined;
   let agent: Agent;
@@ -278,10 +324,152 @@ async function main(): Promise<void> {
         break;
       }
       case "/clear": agent.shortTerm.clear(); console.log("Short-term memory cleared."); break;
+      case "/model": {
+        const route = getRoute(config.route) ?? ROUTES[0]!;
+        if (args[0] === "--save") {
+          updateActive({ model: agent.model });
+          console.log(`Saved ${agent.model} as the default for profile "${config.profileName}".`);
+          break;
+        }
+        if (args[0] && args[0] !== "--refresh") {          // direct: /model haiku
+          const id = resolveModel(args[0], route, config.modelPins);
+          agent.setModel(id);
+          console.log(`Model for this session: ${describeModel(id, route, config.modelPins)}`);
+          console.log(pc.dim("  /model --save   make it the profile default"));
+          break;
+        }
+        // Ask the provider what this key can actually use; cached for a day.
+        if (args[0] === "--refresh") clearCache(route.id);
+        let discovered = readCache(route.id);
+        if (!discovered) {
+          process.stdout.write(pc.dim("  fetching available models… "));
+          discovered = await agent.llm.listModels();
+          process.stdout.write("\r\x1b[2K");
+          if (discovered.length) writeCache(route.id, discovered);
+        }
+        const entries = buildPicker(route, discovered ?? [], agent.model);
+        if (!entries.length) {
+          console.log(`No model list available for ${route.label}. Set one with: /model <id>`);
+          break;
+        }
+        const width = Math.min(34, Math.max(...entries.map((e) => e.label.length)) + 2);
+        const labels = entries.map((e) =>
+          `${e.label.padEnd(width)}${pc.dim(e.blurb)}${e.live ? pc.dim("  ·live") : ""}`);
+        const curIdx = entries.findIndex(
+          (e) => e.value === agent.model || resolveModel(e.value, route, config.modelPins) === agent.model);
+        const pick = await select(rl, "Select model (this session)", labels, curIdx < 0 ? 0 : curIdx);
+        const chosen = entries[pick]!;
+        const id = resolveModel(chosen.value, route, config.modelPins);
+        agent.setModel(id);
+        console.log(`Model for this session: ${describeModel(id, route, config.modelPins)}`);
+        console.log(pc.dim("  /model --save   keep it · /model --refresh   re-check the provider"));
+        break;
+      }
+      case "/key": {
+        const route = getRoute(config.route) ?? ROUTES[0]!;
+        const name = args[1] ?? route.keyEnv ?? "ANTHROPIC_API_KEY";
+        if (args[0] === "set") {
+          const val = await readSecret(rl, `  ${name} (hidden): `);
+          if (!val) { console.log("Nothing entered."); break; }
+          const problem = looksLikeKey(name, val);
+          if (problem) {
+            console.log(pc.yellow(`  ${problem}.`));
+            const ok = await select(rl, "Save it anyway?", ["No, discard it", "Yes, save it"]);
+            if (ok === 0) { console.log("Discarded."); break; }
+          }
+          saveCredential(name, val);
+          console.log(`Saved ${name} (${maskCredential(val)}) — kept on this computer only.`);
+          console.log(pc.dim(`  ${credentialsPath()}, readable only by you — restart faber to use it`));
+        } else if (args[0] === "rm") {
+          console.log(deleteCredential(name) ? `Removed ${name}.` : `No stored ${name}.`);
+        } else {
+          const names = listCredentialNames();
+          if (!names.length) console.log(`No stored credentials. Add one with: /key set [${name}]`);
+          for (const n of names) {
+            const stored = getCredential(n)!;
+            const shadowed = process.env[n] ? pc.dim("  (env var takes precedence)") : "";
+            console.log(`  ${n.padEnd(24)} ${maskCredential(stored)}${shadowed}`);
+          }
+          console.log(pc.dim(`  ${credentialsPath()}`));
+        }
+        break;
+      }
+      case "/setup": {
+        const setup = await runOnboarding(rl);
+        reportSetup(setup);
+        console.log(pc.dim("  restart faber to apply"));
+        break;
+      }
+      case "/route": {
+        const groups = vendors();
+        const vi = await select(rl, "Select vendor", groups.map((g) => g.vendor));
+        const rs = groups[vi]!.routes;
+        const ri = await select(rl, "Select route",
+          rs.map((r) => `${r.label.padEnd(28)} ${pc.dim(r.hint)}${r.implemented ? "" : pc.yellow("  (not yet wired)")}`));
+        const chosen = rs[ri]!;
+        if (!chosen.implemented) {
+          console.log(pc.yellow(`${chosen.label} isn't wired up yet — see the roadmap in the README.`));
+          break;
+        }
+        let region: string | undefined;
+        if (chosen.needsRegion) {
+          const ans = (await rl.question(`AWS region [${DEFAULT_REGION}]: `)).trim();
+          region = ans || DEFAULT_REGION;
+        }
+        let baseUrl = chosen.baseUrl;
+        if (chosen.needsBaseUrl) {
+          baseUrl = (await rl.question("Base URL (OpenAI-compatible): ")).trim() || undefined;
+        }
+        updateActive({ route: chosen.id, baseUrl, region, apiKeyEnv: chosen.keyEnv });
+        console.log(`Route set to ${chosen.label}.`);
+        const url = baseUrl ?? baseUrlFor(chosen, region);
+        if (url) console.log(pc.dim(`  endpoint: ${url}`));
+        if (chosen.keyEnv && !resolveCredential(chosen.keyEnv)) {
+          if (chosen.id === "bedrock") {
+            const { discoverAwsCredentials } = await import("./sigv4.js");
+            const aws = await discoverAwsCredentials();
+            console.log(aws
+              ? pc.dim(`  no ${chosen.keyEnv} needed — signing with AWS credentials from ${aws.source}`)
+              : pc.yellow(`  set ${chosen.keyEnv}, or run where an IAM role is available (SageMaker, ECS, EC2)`));
+          } else {
+            console.log(pc.yellow(`  ${chosen.keyEnv} is not set.`));
+          }
+        }
+        if (chosen.aliasesArePinned) {
+          console.log(pc.dim("  model ids differ on this route — set one with: /model <id>"));
+        }
+        console.log(pc.dim("  restart faber to apply"));
+        break;
+      }
+      case "/profile": {
+        const st = loadSettings();
+        if (!args[0]) {
+          for (const [name, p] of Object.entries(st.profiles)) {
+            const mark = name === st.activeProfile ? pc.cyan("❯") : " ";
+            const r = getRoute(p.route);
+            console.log(`${mark} ${name.padEnd(12)} ${(r?.label ?? p.route).padEnd(26)} ${pc.dim(p.model ?? "")}`);
+          }
+          console.log(pc.dim(`  ${settingsPath()}`));
+          console.log(pc.dim("  switch with: /profile <name>"));
+          break;
+        }
+        if (!st.profiles[args[0]]) { console.log(`No profile "${args[0]}".`); break; }
+        st.activeProfile = args[0];
+        saveSettings(st);
+        console.log(`Active profile: ${args[0]}. Restart faber to apply.`);
+        break;
+      }
       case "/usage": {
-        console.log(renderUsagePanel(agent.usage,
-          Number(process.env.CW_PRICE_IN) || undefined,
-          Number(process.env.CW_PRICE_OUT) || undefined));
+        if (args[0] === "--refresh-prices") {
+          process.stdout.write(pc.dim("  fetching current prices… "));
+          const n = await refreshPrices(undefined, { baseUrl: config.baseUrl, force: true });
+          process.stdout.write("\r\x1b[2K");
+          console.log(
+            n === "unchanged" ? "Prices confirmed current."
+            : typeof n === "number" ? `Prices updated (${n} models).`
+            : pc.yellow("Couldn't fetch prices — keeping the rates already known."));
+        }
+        console.log(renderUsagePanel(agent.usage, { in: config.priceIn, out: config.priceOut }));
         break;
       }
       case "/verbose": agent.verbose = true; console.log("Verbose mode ON: full-depth explanations (higher token cost)."); break;
@@ -296,7 +484,12 @@ async function main(): Promise<void> {
   try {
     if (task) { await runTask(task); return; }
     console.log(pc.cyan(`Faber v${VERSION} — agentic coding assistant`));
-    console.log(pc.dim(`workspace: ${config.workspace}\nmodel: ${config.model} (${config.provider})  approval: ${approvalMode}`));
+    console.log(pc.dim(
+      `workspace: ${config.workspace}\n` +
+      `model: ${describeModel(config.model, getRoute(config.route) ?? ROUTES[0]!, config.modelPins)}` +
+      `  route: ${getRoute(config.route)?.label ?? config.route}` +
+      (config.profileName !== "default" ? `  profile: ${config.profileName}` : "") +
+      `  approval: ${approvalMode}`));
     if (isRepo(config.workspace) && isDirty(config.workspace)) {
       console.log(pc.yellow("Git: you have uncommitted changes — consider committing before letting me edit."));
     }
@@ -360,7 +553,7 @@ const HELP = `
   /restore <id>       jump files back to before a specific task
   /clear              clear short-term conversation memory
   /ask | /auto        approval mode: preview diffs and commands (default) / apply freely
-                      env: CW_APPROVAL=auto to change default; CW_GIT=commit for one git commit per task
+                      env: FABER_APPROVAL=auto to change default; FABER_GIT=commit for one git commit per task
   /exit               quit
 `;
 

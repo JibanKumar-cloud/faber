@@ -74,6 +74,13 @@ function tmpConfig(baseUrl: string): Config {
     indexDb: path.join(stateDir, "index.db"),
     sessionsDir: path.join(stateDir, "sessions"),
     usageDb: path.join(stateDir, "usage.db"),
+    route: "anthropic-api",
+    region: undefined,
+    modelPins: {},
+    profileName: "default",
+    priceIn: undefined,
+    priceOut: undefined,
+    autoRefreshPrices: false,
   };
 }
 
@@ -160,7 +167,11 @@ test("e2e: CLI one-shot keeps the FIRST word of the task (regression: wsIdx=-1 b
   ]);
   const cfg = tmpConfig(srv.url);
   const { spawn } = await import("node:child_process");
-  const cli = new URL("../src/index.js", import.meta.url).pathname;
+  // fileURLToPath, NOT .pathname: on Windows a file URL's pathname is
+  // "/D:/a/faber/..." — the leading slash makes Node treat it as relative and
+  // resolve it to "C:\D:\a\faber\...", which then doesn't exist.
+  const { fileURLToPath } = await import("node:url");
+  const cli = fileURLToPath(new URL("../src/index.js", import.meta.url));
   // async spawn (NOT execFileSync): the mock server runs in this process, so
   // a synchronous wait would block the event loop and deadlock the server.
   const out = await new Promise<string>((resolve, reject) => {
