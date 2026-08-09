@@ -13,6 +13,7 @@ import * as path from "node:path";
 function withHome<T>(dir: string, fn: () => T): T {
   const prev = process.env.HOME;
   process.env.HOME = dir;
+  process.env.USERPROFILE = dir;   // os.homedir() uses this on Windows
   try { return fn(); } finally { process.env.HOME = prev; }
 }
 
@@ -115,6 +116,7 @@ test("bedrock counts as complete when AWS credentials can sign, with no key", as
   const osx = await import("node:os");
   const pathx = await import("node:path");
   process.env.HOME = fsx.mkdtempSync(pathx.join(osx.tmpdir(), "faber-bd-"));
+  process.env.USERPROFILE = fsx.mkdtempSync(pathx.join(osx.tmpdir(), "faber-bd-"));   // os.homedir() uses this on Windows
   try {
     delete process.env.AWS_ACCESS_KEY_ID;
     delete process.env.AWS_SECRET_ACCESS_KEY;
@@ -128,6 +130,8 @@ test("bedrock counts as complete when AWS credentials can sign, with no key", as
     assert.equal(withRole.complete, true, "an IAM role IS a complete setup — no key needed");
   } finally {
     process.env.HOME = prev.home;
+    process.env.USERPROFILE = prev.home;
+    process.env.USERPROFILE = prev.home;   // os.homedir() uses this on Windows
     if (prev.id === undefined) delete process.env.AWS_ACCESS_KEY_ID; else process.env.AWS_ACCESS_KEY_ID = prev.id;
     if (prev.secret === undefined) delete process.env.AWS_SECRET_ACCESS_KEY; else process.env.AWS_SECRET_ACCESS_KEY = prev.secret;
   }

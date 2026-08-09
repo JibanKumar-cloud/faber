@@ -69,6 +69,7 @@ test("usage: a recorded cost is immutable — later price changes never rewrite 
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "faber-hist-"));
   const prev = process.env.HOME;
   process.env.HOME = home;
+  process.env.USERPROFILE = home;   // os.homedir() uses this on Windows
   try {
     // day 1: the model costs $2/$10
     writePriceCache({ "test-model": { in: 2, out: 10 } }, "test");
@@ -95,6 +96,8 @@ test("usage: a recorded cost is immutable — later price changes never rewrite 
     reopened.close();
   } finally {
     process.env.HOME = prev;
+    process.env.USERPROFILE = prev;
+    process.env.USERPROFILE = prev;   // os.homedir() uses this on Windows
   }
 });
 
@@ -122,6 +125,7 @@ test("pricing: staleness is tracked so stale rates can't silently enter history"
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "faber-stale-"));
   const prev = process.env.HOME;
   process.env.HOME = home;
+  process.env.USERPROFILE = home;   // os.homedir() uses this on Windows
   try {
     assert.equal(priceAgeDays(), undefined, "never fetched");
     assert.equal(pricesAreStale(), true, "built-in defaults count as stale");
@@ -135,6 +139,8 @@ test("pricing: staleness is tracked so stale rates can't silently enter history"
     assert.equal(pricesAreStale(later), true, "goes stale after the window");
   } finally {
     process.env.HOME = prev;
+    process.env.USERPROFILE = prev;
+    process.env.USERPROFILE = prev;   // os.homedir() uses this on Windows
   }
 });
 
@@ -144,6 +150,7 @@ test("config: price auto-refresh is on by default and opt-out-able", async () =>
   const ws = fs.mkdtempSync(path.join(os.tmpdir(), "faber-ws-"));
   const prevHome = process.env.HOME, prevEnv = process.env.FABER_AUTO_PRICES;
   process.env.HOME = home;
+  process.env.USERPROFILE = home;   // os.homedir() uses this on Windows
   try {
     delete process.env.FABER_AUTO_PRICES;
     assert.equal(loadConfig(ws).autoRefreshPrices, true, "on by default");
@@ -160,6 +167,8 @@ test("config: price auto-refresh is on by default and opt-out-able", async () =>
     assert.equal(loadConfig(ws).autoRefreshPrices, false, "profile opt-out respected");
   } finally {
     process.env.HOME = prevHome;
+    process.env.USERPROFILE = prevHome;
+    process.env.USERPROFILE = prevHome;   // os.homedir() uses this on Windows
     if (prevEnv === undefined) delete process.env.FABER_AUTO_PRICES;
     else process.env.FABER_AUTO_PRICES = prevEnv;
   }
@@ -171,6 +180,7 @@ test("pricing: a failed refresh backs off instead of retrying every launch", asy
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "faber-backoff-"));
   const prev = process.env.HOME;
   process.env.HOME = home;
+  process.env.USERPROFILE = home;   // os.homedir() uses this on Windows
   try {
     assert.equal(shouldAutoRefresh(), true, "first ever launch: try");
 
@@ -187,6 +197,8 @@ test("pricing: a failed refresh backs off instead of retrying every launch", asy
     assert.equal(shouldAutoRefresh(tomorrow), true, "retries once a day, not every run");
   } finally {
     process.env.HOME = prev;
+    process.env.USERPROFILE = prev;
+    process.env.USERPROFILE = prev;   // os.homedir() uses this on Windows
   }
 });
 
@@ -195,6 +207,7 @@ test("pricing: every launch re-checks (a 304 is free); only failures back off", 
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "faber-fresh2-"));
   const prev = process.env.HOME;
   process.env.HOME = home;
+  process.env.USERPROFILE = home;   // os.homedir() uses this on Windows
   try {
     assert.equal(shouldAutoRefresh(), true, "never fetched");
     writePriceCache({ m: { in: 1, out: 2 } }, "test");
@@ -202,6 +215,8 @@ test("pricing: every launch re-checks (a 304 is free); only failures back off", 
       "checks again next launch — conditional requests cost ~0 bytes when unchanged");
   } finally {
     process.env.HOME = prev;
+    process.env.USERPROFILE = prev;
+    process.env.USERPROFILE = prev;   // os.homedir() uses this on Windows
   }
 });
 
@@ -211,6 +226,7 @@ test("pricing: a 304 confirms prices without re-downloading them", async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "faber-304-"));
   const prev = process.env.HOME;
   process.env.HOME = home;
+  process.env.USERPROFILE = home;   // os.homedir() uses this on Windows
   try {
     let sentIfNoneMatch: string | undefined;
     let bodyServed = 0;
@@ -242,5 +258,28 @@ test("pricing: a 304 confirms prices without re-downloading them", async () => {
     srv.close();
   } finally {
     process.env.HOME = prev;
+    process.env.USERPROFILE = prev;
+    process.env.USERPROFILE = prev;   // os.homedir() uses this on Windows
+  }
+});
+
+test("tests redirect the home directory on every platform, not just Unix", async () => {
+  const osx = await import("node:os");
+  const saved = { home: process.env.HOME, up: process.env.USERPROFILE };
+  const fsx = await import("node:fs");
+  const pathx = await import("node:path");
+  try {
+    const dir = fsx.mkdtempSync(pathx.join(osx.tmpdir(), "faber-homecheck-"));
+    process.env.HOME = dir;
+    process.env.USERPROFILE = dir;
+    // os.homedir() reads HOME on Unix and USERPROFILE on Windows. Setting only
+    // one leaves the other platform writing into the real home directory,
+    // where tests then clobber each other's caches — the cause of the Windows
+    // CI failures that Linux and macOS never showed.
+    assert.equal(osx.homedir(), dir,
+      "redirection must hold on this platform, or tests share real state");
+  } finally {
+    if (saved.home === undefined) delete process.env.HOME; else process.env.HOME = saved.home;
+    if (saved.up === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = saved.up;
   }
 });

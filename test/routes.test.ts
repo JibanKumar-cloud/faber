@@ -161,6 +161,7 @@ test("a route's own credential is never substituted with the generic one", async
   const ws = fsx.mkdtempSync(pathx.join(osx.tmpdir(), "faber-kw-"));
   const prevHome = process.env.HOME, prevKey = process.env.ANTHROPIC_API_KEY;
   process.env.HOME = home;
+  process.env.USERPROFILE = home;   // os.homedir() uses this on Windows
   process.env.ANTHROPIC_API_KEY = "sk-ant-personal-key";
   try {
     fsx.mkdirSync(pathx.join(home, ".faber"), { recursive: true });
@@ -174,6 +175,8 @@ test("a route's own credential is never substituted with the generic one", async
       "an Anthropic key must not be sent to Bedrock — that 401s and hides SigV4");
   } finally {
     process.env.HOME = prevHome;
+    process.env.USERPROFILE = prevHome;
+    process.env.USERPROFILE = prevHome;   // os.homedir() uses this on Windows
     if (prevKey === undefined) delete process.env.ANTHROPIC_API_KEY;
     else process.env.ANTHROPIC_API_KEY = prevKey;
   }

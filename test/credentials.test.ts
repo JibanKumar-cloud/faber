@@ -78,6 +78,7 @@ test("credentials: an explicitly chosen key beats the environment variable", asy
   const ws = fs.mkdtempSync(path.join(os.tmpdir(), "faber-ws2-"));
   const prevHome = process.env.HOME, prevKey = process.env.ANTHROPIC_API_KEY;
   process.env.HOME = home;
+  process.env.USERPROFILE = home;   // os.homedir() uses this on Windows
   process.env.ANTHROPIC_API_KEY = "sk-ant-from-environment";
   try {
     saveCredential("ANTHROPIC_API_KEY", "sk-ant-explicitly-chosen");
@@ -102,6 +103,8 @@ test("credentials: an explicitly chosen key beats the environment variable", asy
       "an explicit choice must not be silently ignored");
   } finally {
     process.env.HOME = prevHome;
+    process.env.USERPROFILE = prevHome;
+    process.env.USERPROFILE = prevHome;   // os.homedir() uses this on Windows
     if (prevKey === undefined) delete process.env.ANTHROPIC_API_KEY;
     else process.env.ANTHROPIC_API_KEY = prevKey;
   }
@@ -139,7 +142,8 @@ test("secret input: never echoes the key, and works headlessly", async () => {
   assert.equal(got, "sk-ant-secret");
   const screen = written.join("");
   assert.ok(!screen.includes("sk-ant-secret"), "the key must never reach the terminal");
-  assert.ok(screen.includes("•"), "masked instead");
+  assert.equal(screen.replace("key: ", "").trim(), "",
+    "nothing is echoed at all — even dots would reveal the length");
 });
 
 test("credentials: obvious non-keys are flagged, real keys pass", async () => {
@@ -156,3 +160,48 @@ test("credentials: obvious non-keys are flagged, real keys pass", async () => {
   // unknown providers aren't second-guessed beyond the basics
   assert.equal(looksLikeKey("BEDROCK_API_KEY", "ABSKQmVkcm9ja0FQSUtleS1" + "z".repeat(20)), undefined);
 });
+
+test("secret input: bracketed-paste markers never end up inside the key", async () => {
+  const { readSecret } = await import("../src/prompt.js");
+  const { PassThrough } = await import("node:stream");
+
+  const stdin = new PassThrough() as unknown as NodeJS.ReadStream;
+  (stdin as { isTTY?: boolean }).isTTY = true;
+  (stdin as unknown as { setRawMode: (b: boolean) => void }).setRawMode = () => {};
+  const written: string[] = [];
+  const stdout = {
+    isTTY: true, write: (s: string) => { written.push(s); return true; },
+  } as unknown as NodeJS.WriteStream;
+  const rl = { pause() {}, resume() {} } as unknown as
+    import("node:readline/promises").Interface;
+
+  const p = readSecret(rl, "key: ", { stdin, stdout });
+  await new Promise((r) => setImmediate(r));
+  // exactly what a terminal sends when you paste with bracketed paste enabled
+  (stdin as unknown as import("node:stream").PassThrough)
+    .write("\x1b[200~sk-ant-api03-realkeyvalue\x1b[201~\r");
+  const got = await p;
+
+  assert.equal(got, "sk-ant-api03-realkeyvalue",
+    "the paste markers must not become part of the key");
+  assert.ok(!got.includes("200~") && !got.includes("201~"));
+  assert.ok(!written.join("").includes("sk-ant"), "still never echoed");
+});
+
+test("secret input: arrow keys and stray escapes are ignored, not typed", async () => {
+  const { readSecret } = await import("../src/prompt.js");
+  const { PassThrough } = await import("node:stream");
+  const stdin = new PassThrough() as unknown as NodeJS.ReadStream;
+  (stdin as { isTTY?: boolean }).isTTY = true;
+  (stdin as unknown as { setRawMode: (b: boolean) => void }).setRawMode = () => {};
+  const stdout = { isTTY: true, write: () => true } as unknown as NodeJS.WriteStream;
+  const rl = { pause() {}, resume() {} } as unknown as
+    import("node:readline/promises").Interface;
+
+  const p = readSecret(rl, "key: ", { stdin, stdout });
+  await new Promise((r) => setImmediate(r));
+  (stdin as unknown as import("node:stream").PassThrough)
+    .write("sk-\x1b[Aant-\x1b[Dkey12345\r");
+  assert.equal(await p, "sk-ant-key12345");
+});
+

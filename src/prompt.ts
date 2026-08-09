@@ -125,14 +125,26 @@ export async function readSecret(
       resolve(value.trim());
     };
     const onData = (buf: Buffer): void => {
-      for (const ch of buf.toString("utf8")) {
+      // Terminals wrap pasted text in bracketed-paste markers, ESC[200~ before
+      // and ESC[201~ after. The ESC byte is below space and gets dropped by the
+      // printable test below, but "[200~" is ordinary text and would be glued
+      // onto the secret — which is how a pasted key ends up rejected as
+      // malformed. Strip the markers, and any other escape sequence, first.
+      const chunk = buf.toString("utf8")
+        .replace(/\x1b\[20[01]~/g, "")
+        .replace(/\x1b\[[0-9;]*[A-Za-z~]/g, "")
+        .replace(/\x1b./g, "");
+      for (const ch of chunk) {
         if (ch === "\r" || ch === "\n") return done();
         if (ch === "\x03") { value = ""; return done(); }        // Ctrl-C
         if (ch === "\x7f" || ch === "\b") {                      // backspace
-          if (value.length) { value = value.slice(0, -1); stdout.write("\b \b"); }
+          if (value.length) value = value.slice(0, -1);
           continue;
         }
-        if (ch >= " ") { value += ch; stdout.write("•"); }
+        // Echo nothing at all, the way sudo and ssh do. Masking characters
+        // would still reveal the key's length, and a hundred dots for a long
+        // key looks like something went wrong.
+        if (ch >= " ") value += ch;
       }
     };
     stdin.on("data", onData);

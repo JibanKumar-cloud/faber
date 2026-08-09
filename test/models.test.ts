@@ -11,6 +11,7 @@ import { LLMClient } from "../src/llm.js";
 function tmpHome(): string {
   const d = fs.mkdtempSync(path.join(os.tmpdir(), "faber-models-"));
   process.env.HOME = d;
+  process.env.USERPROFILE = d;   // os.homedir() uses this on Windows
   return d;
 }
 
