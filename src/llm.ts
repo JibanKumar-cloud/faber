@@ -6,6 +6,7 @@
  */
 import type { Config } from "./config.js";
 import { signRequest, discoverAwsCredentials, type AwsCredentials } from "./sigv4.js";
+import { priceFor } from "./pricing.js";
 import { FatalError, TransientAPIError, withRetries, CancelledError } from "./errors.js";
 
 export type ContentBlock =
@@ -33,6 +34,14 @@ export interface LLMResponse {
 }
 
 const RETRYABLE = new Set([408, 409, 429, 500, 502, 503, 504, 529]);
+
+/**
+ * Why the last model listing came back empty. "Couldn't reach the provider"
+ * is not a useful thing to tell someone whose key demonstrably works — the
+ * status code or error usually says exactly what went wrong.
+ */
+let lastListError: string | undefined;
+export function lastModelListError(): string | undefined { return lastListError; }
 
 /** AWS credentials discovered once per process for SigV4 routes. */
 let awsCredsPromise: Promise<AwsCredentials | undefined> | undefined;
@@ -90,6 +99,7 @@ export class LLMClient {
   }
 
   async listModels(signal?: AbortSignal): Promise<{ id: string; name?: string; created?: number }[]> {
+    lastListError = undefined;
     const anthropic = this.config.provider === "anthropic";
     const url = anthropic
       ? `${this.config.baseUrl}/v1/models?limit=100`
@@ -103,7 +113,10 @@ export class LLMClient {
       signal?.addEventListener("abort", () => ctl.abort(), { once: true });
       const res = await fetch(url, { headers, signal: ctl.signal });
       clearTimeout(timer);
-      if (!res.ok) return [];
+      if (!res.ok) {
+        lastListError = `HTTP ${res.status} from ${url}`;
+        return [];
+      }
       const body = await res.json() as {
         data?: { id?: string; display_name?: string; created?: number; created_at?: string }[];
       };
@@ -119,7 +132,8 @@ export class LLMClient {
             : m.created_at ? Math.floor(Date.parse(m.created_at) / 1000) || undefined
             : undefined,
         }));
-    } catch {
+    } catch (e) {
+      lastListError = e instanceof Error ? e.message : String(e);
       return [];   // offline, no permission, or an endpoint without the route
     }
   }
@@ -162,10 +176,15 @@ export class LLMClient {
     signal?: AbortSignal,
     modelOverride?: string,
   ): Promise<LLMResponse> {
+    // Which OpenAI API a model speaks isn't a user setting — the dataset
+    // records it per model, so route on that rather than asking anyone.
+    const model = modelOverride ?? this.config.model;
     return withRetries(
       () => this.config.provider === "anthropic"
         ? this.anthropicStream(system, messages, tools, onText, signal, modelOverride)
-        : this.openaiStream(system, messages, tools, onText, signal, modelOverride),
+        : usesResponsesApi(model)
+          ? this.responsesStream(system, messages, tools, onText, signal, modelOverride)
+          : this.openaiWithResponsesFallback(system, messages, tools, onText, signal, modelOverride),
       { maxAttempts: this.config.retryMaxAttempts, signal },
     );
   }
@@ -335,6 +354,149 @@ export class LLMClient {
     return { text, toolCalls, rawContent, stopReason: toolCalls.length ? "tool_use" : "end_turn", usage };
   }
 
+
+  /**
+   * Chat completions, retrying on the Responses API if the provider says the
+   * model belongs there.
+   *
+   * Routing normally comes from the dataset, but a model can be missing from
+   * it, or the local copy can predate the fields we read. Rather than failing
+   * with a 404 the user can do nothing about, take the provider at its word
+   * and retry on the endpoint it named.
+   */
+  private async openaiWithResponsesFallback(
+    system: string, messages: Message[], tools: ToolSchema[],
+    onText?: (d: string) => void, signal?: AbortSignal, modelOverride?: string,
+  ): Promise<LLMResponse> {
+    try {
+      return await this.openaiStream(system, messages, tools, onText, signal, modelOverride);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      if (!/responses/i.test(msg) || !/endpoint|not supported/i.test(msg)) throw e;
+      return this.responsesStream(system, messages, tools, onText, signal, modelOverride);
+    }
+  }
+
+  // ------------------------------------------------------------- responses
+  /**
+   * OpenAI's Responses API — the only way to reach the codex models, which are
+   * the coding-tuned ones a coding agent actually wants.
+   *
+   * Three things differ from chat completions, and each is a place to get it
+   * wrong: the request carries `instructions` and `input` rather than a
+   * `messages` array; the stream is a sequence of named events keyed by a
+   * `type` field rather than `choices[].delta`; and usage arrives as
+   * input_tokens/output_tokens, which the cost ledger reads directly, so a
+   * mismatch here silently under-reports spend rather than failing loudly.
+   */
+  private async responsesStream(
+    system: string, messages: Message[], tools: ToolSchema[],
+    onText?: (d: string) => void, signal?: AbortSignal, modelOverride?: string,
+  ): Promise<LLMResponse> {
+    const input: Record<string, unknown>[] = [];
+    for (const m of messages) input.push(...toResponsesInput(m));
+
+    const body: Record<string, unknown> = {
+      model: modelOverride ?? this.config.model,
+      instructions: system,
+      input,
+      stream: true,
+      max_output_tokens: this.config.maxTokens,
+    };
+    if (tools.length) {
+      // Flatter than chat completions: no nested `function` object.
+      body.tools = tools.map((t) => ({
+        type: "function",
+        name: t.name,
+        description: t.description,
+        parameters: t.input_schema,
+      }));
+    }
+
+    const res = await this.post(`${this.config.baseUrl}/responses`, {
+      Authorization: `Bearer ${this.config.apiKey}`,
+      "content-type": "application/json",
+    }, body, signal);
+
+    let text = "";
+    const usage: Usage = { input: 0, cacheRead: 0, cacheWrite: 0, output: 0 };
+    // Tool calls arrive as items announced first, then filled in by argument
+    // deltas addressed to the item's id.
+    const calls = new Map<string, { id: string; name: string; args: string }>();
+
+    for await (const evt of sseEvents(res, signal)) {
+      const e = evt as Record<string, any>;
+      switch (e.type) {
+        case "response.output_text.delta": {
+          const d = typeof e.delta === "string" ? e.delta : "";
+          if (d) { text += d; onText?.(d); }
+          break;
+        }
+        case "response.output_item.added": {
+          const item = e.item;
+          if (item?.type === "function_call") {
+            calls.set(String(item.id ?? item.call_id), {
+              id: String(item.call_id ?? item.id ?? ""),
+              name: String(item.name ?? ""),
+              args: typeof item.arguments === "string" ? item.arguments : "",
+            });
+          }
+          break;
+        }
+        case "response.function_call_arguments.delta": {
+          const key = String(e.item_id ?? "");
+          const cur = calls.get(key) ?? { id: key, name: "", args: "" };
+          cur.args += typeof e.delta === "string" ? e.delta : "";
+          calls.set(key, cur);
+          break;
+        }
+        case "response.function_call_arguments.done": {
+          // Some responses send the complete arguments here instead of deltas.
+          const key = String(e.item_id ?? "");
+          const cur = calls.get(key);
+          if (cur && !cur.args && typeof e.arguments === "string") cur.args = e.arguments;
+          break;
+        }
+        case "response.completed":
+        case "response.incomplete": {
+          const u = e.response?.usage;
+          if (u) {
+            const cached = u.input_tokens_details?.cached_tokens ?? 0;
+            usage.input = (u.input_tokens ?? 0) - cached;
+            usage.cacheRead = cached;
+            usage.output = u.output_tokens ?? 0;
+          }
+          break;
+        }
+        case "error":
+        case "response.failed": {
+          const msg = e.message ?? e.response?.error?.message ?? "stream failed";
+          throw new FatalError(`Responses API error: ${String(msg)}`);
+        }
+        default: break;   // ignore lifecycle events we don't need
+      }
+    }
+
+    const toolCalls = [...calls.values()]
+      .filter((c) => c.name)
+      .map((c) => {
+        let parsed: Record<string, unknown> = {};
+        try { parsed = c.args ? JSON.parse(c.args) : {}; } catch { /* leave empty */ }
+        return { id: c.id, name: c.name, input: parsed };
+      });
+
+    const rawContent: ContentBlock[] = [];
+    if (text) rawContent.push({ type: "text", text });
+    for (const c of toolCalls) {
+      rawContent.push({ type: "tool_use", id: c.id, name: c.name, input: c.input });
+    }
+    return {
+      text, toolCalls, rawContent,
+      stopReason: toolCalls.length ? "tool_use" : "end_turn",
+      usage,
+    };
+  }
+
   // ------------------------------------------------------------------ http
   private async post(url: string, headers: Record<string, string>, body: unknown, signal?: AbortSignal): Promise<Response> {
     let res: Response;
@@ -354,18 +516,26 @@ export class LLMClient {
     }
     if (!res.ok) {
       const body = (await res.text()).slice(0, 500);
+      // Record what the provider just told us. Neither OpenAI's catalogue nor
+      // its /v1/models response flags retired models or says which endpoint a
+      // model needs, so the failing request is the only reliable signal — and
+      // remembering it keeps the model out of every future menu.
+      const { classifyModelError, markUnusable } = await import("./models.js");
+      const why = classifyModelError(body);
+      if (why) markUnusable(this.config.model, why);
+
       // Some newer OpenAI models are only served by the Responses API, which
       // Faber doesn't speak yet. The raw 404 doesn't say what to do about it.
       if (/v1\/responses endpoint/i.test(body)) {
+        // Not fatal: the caller retries this request on the Responses API.
         throw new FatalError(
-          `${this.config.model} needs OpenAI's Responses API, which Faber doesn't support yet.\n` +
-          `  Pick a model that works with chat completions — /model, then try gpt-5.4 or gpt-5.5.`,
+          `${this.config.model} is served by the responses endpoint, not chat completions.`,
         );
       }
       if (/has been deprecated/i.test(body)) {
         throw new FatalError(
           `${this.config.model} has been deprecated by the provider.\n` +
-          `  Choose another with /model — the catalogue still lists retired models.`,
+          `  It won't be offered again. Pick another with /model.`,
         );
       }
       throw new FatalError(`API error HTTP ${res.status}: ${body}`);
@@ -399,6 +569,58 @@ async function* sseEvents(res: Response, signal?: AbortSignal): AsyncGenerator<u
   } finally {
     reader.releaseLock();
   }
+}
+
+
+/**
+ * Convert a message to Responses API input items.
+ *
+ * The Responses API doesn't take a `messages` array of chat turns. It takes a
+ * flat list of items where a tool call and its result are siblings rather than
+ * nested inside an assistant turn — so one Faber message can expand into
+ * several items. Tool calls are joined to their results by `call_id`.
+ */
+/**
+ * Does this model require the Responses API? Answered by the pricing dataset's
+ * `mode` and `supported_endpoints`, refreshed on every launch, so a model
+ * released tomorrow routes correctly without a Faber update.
+ */
+export function usesResponsesApi(modelId: string): boolean {
+  const p = priceFor(modelId);
+  if (p?.mode === "responses") return true;
+  if (p?.endpoints?.length) {
+    return p.endpoints.includes("/v1/responses")
+      && !p.endpoints.some((e) => e.includes("chat/completions"));
+  }
+  return false;
+}
+
+function toResponsesInput(m: Message): Record<string, unknown>[] {
+  const out: Record<string, unknown>[] = [];
+  const texts: string[] = [];
+  for (const b of m.content) {
+    if (b.type === "text") texts.push(b.text);
+    else if (b.type === "tool_use") {
+      out.push({
+        type: "function_call",
+        call_id: b.id,
+        name: b.name,
+        arguments: JSON.stringify(b.input),
+      });
+    } else if (b.type === "tool_result") {
+      out.push({
+        type: "function_call_output",
+        call_id: b.tool_use_id,
+        output: typeof b.content === "string" ? b.content : JSON.stringify(b.content),
+      });
+    }
+  }
+  if (texts.length) {
+    // input_text for what we send, output_text for what the model said
+    const kind = m.role === "assistant" ? "output_text" : "input_text";
+    out.unshift({ role: m.role, content: [{ type: kind, text: texts.join("\n") }] });
+  }
+  return out;
 }
 
 function toOpenAI(m: Message): Record<string, unknown>[] {

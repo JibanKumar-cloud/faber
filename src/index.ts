@@ -48,7 +48,7 @@ import {
   maskCredential, credentialsPath, permissionsAreLoose, resolveCredential, looksLikeKey,
 } from "./credentials.js";
 import { readCache, writeCache, clearCache, buildPicker } from "./models.js";
-import { refreshPrices, priceFor, pricesAreStale, shouldAutoRefresh, priceAgeDays, STALE_AFTER_DAYS } from "./pricing.js";
+import { refreshPrices, priceFor, pricesAreStale, shouldAutoRefresh, priceAgeDays, readPriceCache, STALE_AFTER_DAYS } from "./pricing.js";
 import type { PendingWrite } from "./tools/fs.js";
 
 /** Version comes from package.json — one source of truth for banner and --version. */
@@ -337,6 +337,15 @@ async function main(): Promise<void> {
           console.log(`Model for this session: ${describeModel(id, route, config.modelPins)}`);
           console.log(pc.dim("  /model --save   make it the profile default"));
           break;
+        }
+        // With no price data at all — first run, or the cache was discarded
+        // because an older Faber wrote it — wait for the fetch rather than
+        // rendering a menu that says "price unknown" for everything. The
+        // background refresh is fine when we already have rates to show.
+        if (!readPriceCache()) {
+          process.stdout.write(pc.dim("  fetching prices… "));
+          await refreshPrices(undefined, { baseUrl: config.baseUrl });
+          process.stdout.write("\r\x1b[2K");
         }
         // Ask the provider what this key can actually use; cached for a day.
         if (args[0] === "--refresh") clearCache(route.id);

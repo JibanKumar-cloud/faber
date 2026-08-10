@@ -251,37 +251,15 @@ test("model picker keeps chat models and drops ones that can't chat", async () =
   assert.deepEqual(live, ["o3-mini"], "only chat models are appended (gpt-4o is already an alias)");
 });
 
-test("unsupported-endpoint and deprecation errors say what to do next", async () => {
-  const { LLMClient } = await import("../src/llm.js");
-  const http = await import("node:http");
-  const open: import("node:http").Server[] = [];
-  const serve = async (body: string): Promise<string> => {
-    const s = http.createServer((_q, r) => { r.writeHead(404); r.end(body); });
-    open.push(s);
-    return new Promise((res) => s.listen(0, "127.0.0.1", () =>
-      res(`http://127.0.0.1:${(s.address() as { port: number }).port}`)));
-  };
-  const cfg = (baseUrl: string) => ({
-    ...baseCfg, provider: "openai" as const, baseUrl, model: "gpt-5.3-codex",
-  });
-
-  const responsesOnly = await serve(JSON.stringify({
-    error: { message: "This model is not supported in the v1/chat/completions endpoint. Use the v1/responses endpoint instead." },
-  }));
-  await assert.rejects(
-    new LLMClient(cfg(responsesOnly)).complete("s", [], [], () => {}),
-    (e: Error) => /Responses API/.test(e.message) && /\/model/.test(e.message),
-  );
-
-  const deprecated = await serve(JSON.stringify({
-    error: { message: "The model `gpt-5.1-codex-mini` has been deprecated" },
-  }));
-  await assert.rejects(
-    new LLMClient(cfg(deprecated)).complete("s", [], [], () => {}),
-    (e: Error) => /deprecated/.test(e.message) && /\/model/.test(e.message),
-  );
-
-  for (const s of open) s.close();
+test("a deprecation error explains itself; an endpoint mismatch is retried", async () => {
+  const { classifyModelError } = await import("../src/models.js");
+  // A retired model is a dead end the user must act on.
+  assert.equal(classifyModelError("The model `x` has been deprecated"), "deprecated");
+  // An endpoint mismatch is not: the client retries on the endpoint named,
+  // so this classification exists to record it, not to stop the request.
+  assert.equal(
+    classifyModelError("not supported in the v1/chat/completions endpoint. Use the v1/responses endpoint instead."),
+    "wrong-endpoint");
 });
 
 test("OpenAI lists codex models first, then the rest, newest within each", async () => {
@@ -312,4 +290,72 @@ test("OpenAI lists codex models first, then the rest, newest within each", async
   // entries with no date fall below dated ones rather than jumping the queue
   const mixed = [{ id: "zzz-undated" }, { id: "gpt-5.5", created: d("2026-04-23") }];
   assert.deepEqual(sortModels(mixed, "openai").map((m) => m.id), ["gpt-5.5", "zzz-undated"]);
+});
+
+test("a model that fails is remembered and never offered again", async () => {
+  const { classifyModelError, markUnusable, readUnusable, clearUnusable, buildPicker } =
+    await import("../src/models.js");
+  const { getRoute } = await import("../src/routes.js");
+  tmpHome();
+  clearUnusable();
+
+  // the two failures seen in real use, classified from the provider's own words
+  assert.equal(classifyModelError(
+    'The model `gpt-5.1-codex-mini` has been deprecated, learn more here'), "deprecated");
+  assert.equal(classifyModelError('"code": "model_not_found"'), "deprecated");
+  assert.equal(classifyModelError(
+    "This model is not supported in the v1/chat/completions endpoint. Use the v1/responses endpoint instead."),
+    "wrong-endpoint");
+  // an unrelated error teaches nothing, so nothing is hidden
+  assert.equal(classifyModelError("rate limit exceeded"), undefined);
+  assert.equal(classifyModelError("overloaded"), undefined);
+
+  markUnusable("gpt-5.2-codex", "deprecated");
+  markUnusable("gpt-5.3-codex", "wrong-endpoint");
+  assert.deepEqual(readUnusable(), {
+    "gpt-5.2-codex": "deprecated", "gpt-5.3-codex": "wrong-endpoint",
+  });
+
+  // and the picker stops offering them
+  const entries = buildPicker(getRoute("openai-api")!, [
+    { id: "gpt-5.2-codex" }, { id: "gpt-5.3-codex" }, { id: "gpt-5.5" },
+  ], "gpt-5.5");
+  const live = entries.filter((e) => e.live).map((e) => e.value);
+  // The retired model is hidden. The endpoint-mismatch one is NOT: Faber now
+  // speaks that endpoint and retries there, so removing it would hide a model
+  // that works.
+  assert.deepEqual(live, ["gpt-5.3-codex", "gpt-5.5"]);
+  clearUnusable();
+});
+
+test("model capability comes from the dataset, not from guessing at names", async () => {
+  const { isChatModel, requiresUnsupportedApi } = await import("../src/models.js");
+  const { writePriceCache } = await import("../src/pricing.js");
+  tmpHome();
+
+  // The dataset states mode and endpoints for each model. Using that beats
+  // reading the id: a name-based rule misclassifies every new naming scheme,
+  // and it can't know that gpt-5.3-codex needs a different endpoint entirely.
+  writePriceCache({
+    "chat-model":    { in: 1, out: 2, mode: "chat" },
+    "codex-model":   { in: 1, out: 2, mode: "responses", endpoints: ["/v1/responses"] },
+    "embed-model":   { in: 1, out: 2, mode: "embedding" },
+    "audio-model":   { in: 1, out: 2, mode: "audio_transcription" },
+    // a chat model whose NAME contains a word the old rules would have banned
+    "chat-embedded-reasoning": { in: 1, out: 2, mode: "chat" },
+  }, "test");
+
+  assert.equal(isChatModel("chat-model"), true);
+  assert.equal(isChatModel("embed-model"), false);
+  assert.equal(isChatModel("audio-model"), false);
+  assert.equal(isChatModel("chat-embedded-reasoning"), true,
+    "the dataset overrides a name that merely looks like an embedding model");
+
+  // Responses-only models are supported now, so they are offered like any
+  // other — the routing happens automatically from the same dataset fields.
+  assert.equal(isChatModel("codex-model"), true, "codex models are usable now");
+  assert.equal(requiresUnsupportedApi("codex-model"), undefined);
+
+  // unknown models still fall back to name rules rather than disappearing
+  assert.equal(isChatModel("brand-new-model-nobody-has-listed"), true);
 });

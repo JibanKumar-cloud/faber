@@ -31,7 +31,7 @@ export class UsageLedger {
   /** When this process started, so the session row can be priced per model. */
   private readonly sessionStart = Date.now();
 
-  constructor(dbPath: string, private projectPath: string) {
+  constructor(dbPath: string, readonly projectPath: string) {
     this.db = new DatabaseSync(dbPath);
     this.db.exec("PRAGMA journal_mode = WAL");
     this.db.exec(`CREATE TABLE IF NOT EXISTS tasks (
@@ -44,6 +44,8 @@ export class UsageLedger {
       try { this.db.exec(`ALTER TABLE tasks ADD COLUMN ${col}`); }
       catch { /* already migrated */ }
     }
+    // Seven time windows each filter on ts, so make that lookup cheap.
+    try { this.db.exec("CREATE INDEX IF NOT EXISTS idx_tasks_ts ON tasks(ts)"); } catch { /* fine */ }
     this.registerProject();
   }
 
@@ -158,92 +160,150 @@ const k = (n: number): string => n >= 1_000_000 ? (n / 1_000_000).toFixed(1) + "
   : n >= 1000 ? (n / 1000).toFixed(1) + "k" : String(n);
 const money = (v: number | undefined): string => v === undefined ? "—" : `$${v.toFixed(2)}`;
 
+/** Cents below a dollar — 3.4¢ reads better than $0.034. */
+const cents = (usd: number): string =>
+  usd < 1 ? `${(usd * 100).toFixed(1)}¢` : `$${usd.toFixed(2)}`;
+
+/** "gpt-5.3-codex", not a 40-character regional deployment id. */
+function shortModel(id: string): string {
+  return id
+    .replace(/^(global|us|eu|apac|au|jp)\./, "")
+    .replace(/^anthropic\./, "")
+    .replace(/-v\d+:\d+$/, "")
+    // "claude-haiku-4-5-20251001" -> "haiku-4-5": the vendor is already known
+    // from the route, and a mid-word truncation reads as a different model.
+    .replace(/^claude-/, "")
+    .replace(/-\d{8}$/, "")
+    .slice(0, 15);
+}
+
+const DAY = 86_400_000;
+
 /**
- * Render the /usage panel. Each row is priced per model using that model's own
- * rates, so a history that spans a switch from Sonnet to Opus stays accurate.
+ * Rolling windows, not calendar ones.
+ *
+ * "This month" means one day on the 1st and thirty on the 31st, and it resets
+ * overnight — two figures side by side aren't comparable. Rolling windows
+ * always cover the span they name.
+ */
+function windows(now: number): [string, number][] {
+  const midnight = new Date(now); midnight.setHours(0, 0, 0, 0);
+  return [
+    ["today", midnight.getTime()],
+    ["last 7 days", now - 7 * DAY],
+    ["last 14 days", now - 14 * DAY],
+    ["last 30 days", now - 30 * DAY],
+    ["last 3 months", now - 91 * DAY],
+    ["last 6 months", now - 182 * DAY],
+    ["all time", 0],
+  ];
+}
+
+interface Band { model: string; totals: UsageTotals; billed: BilledTotals; }
+
+/** Sum a set of per-model bands into one row, pricing anything unrecorded. */
+function rollUp(bands: Band[], override?: { in?: number; out?: number }): {
+  totals: UsageTotals; cost?: number; saved?: number; unpriced: number; estimated: boolean;
+} {
+  const totals: UsageTotals =
+    { input: 0, cacheRead: 0, cacheWrite: 0, output: 0, calls: 0, tasks: 0 };
+  let cost: number | undefined;
+  let saved: number | undefined;
+  let unpriced = 0;
+  let estimated = false;
+  for (const b of bands) {
+    totals.input += b.totals.input; totals.cacheRead += b.totals.cacheRead;
+    totals.cacheWrite += b.totals.cacheWrite; totals.output += b.totals.output;
+    totals.calls += b.totals.calls; totals.tasks += b.totals.tasks;
+    if (b.billed.cost !== null) cost = (cost ?? 0) + b.billed.cost;
+    if (b.billed.saved !== null) saved = (saved ?? 0) + b.billed.saved;
+    if (b.billed.unpriced > 0) {
+      // Tasks recorded before costs were stored have nothing to preserve, so
+      // estimate them at today's rates rather than showing a gap.
+      unpriced += b.billed.unpriced;
+      const p = priceFor(b.model, override);
+      const c = UsageLedger.cost(b.totals, p);
+      const s = UsageLedger.saved(b.totals, p);
+      if (c !== undefined) { cost = (cost ?? 0) + c; estimated = true; }
+      if (s !== undefined) saved = (saved ?? 0) + s;
+    }
+  }
+  return { totals, cost, saved, unpriced, estimated };
+}
+
+/**
+ * The /usage panel for this project.
+ *
+ * Seven fixed windows, never collapsed even when identical: a missing row
+ * would read as "no data" when it actually means "nothing new since", and
+ * that distinction is exactly what someone returning after a break wants.
+ *
+ * The two columns nobody can interpret unaided — cached and saved — are
+ * defined underneath. A metric a reader has to guess at gets ignored.
  */
 export function renderUsagePanel(
   ledger: UsageLedger,
   override?: { in?: number; out?: number },
+  now = Date.now(),
 ): string {
-  const midnight = new Date(); midnight.setHours(0, 0, 0, 0);
-  const windows: [string, number | undefined][] = [
-    ["this session", undefined],
-    ["today", midnight.getTime()],
-    ["all time", 0],
-  ];
+  const W = [15, 7, 9, 8, 7, 8, 9];
+  const cell = (c: string[]): string =>
+    c.map((s, i) => (i === c.length - 1 ? s : s.padEnd(W[i]!))).join(" ").trimEnd();
+  const pad = " ".repeat(W[0]!);
+  const lines: string[] = [path.basename(ledger.projectPath), ""];
 
-  const lines: string[] = [];
-  const W = [13, 7, 12, 9, 7, 9, 9];
-  const cells = (c: string[]): string => c.map((s, i) => s.padEnd(W[i]!)).join(" ");
-  lines.push(cells(["", "tasks", "in", "cached", "out", "cost", "saved"]));
+  lines.push(cell(["", "tasks", "in", "cached", "out", "cost", "saved"]));
 
-  let anyPriced = false;
-  let legacyRows = 0;
-  let estimated = false;
-  for (const [label, since] of windows) {
-    // session totals come from memory; the rest are priced per model from disk
-    // Every window is priced per model — including the session, which would
-    // otherwise apply the last-used model's rates to earlier tasks.
-    const bands = ledger.totalsByModel(since ?? ledger.startedAt);
-    const agg: UsageTotals = { input: 0, cacheRead: 0, cacheWrite: 0, output: 0, calls: 0, tasks: 0 };
-    let cost: number | undefined;
-    let saved: number | undefined;
-    for (const b of bands) {
-      agg.input += b.totals.input; agg.cacheRead += b.totals.cacheRead;
-      agg.cacheWrite += b.totals.cacheWrite; agg.output += b.totals.output;
-      agg.calls += b.totals.calls; agg.tasks += b.totals.tasks;
-      // Historical cost is whatever was charged at the time — never repriced.
-      if (b.billed.cost !== null) { cost = (cost ?? 0) + b.billed.cost; anyPriced = true; }
-      if (b.billed.saved !== null) saved = (saved ?? 0) + b.billed.saved;
-      if (b.billed.unpriced > 0) {
-        // Rows recorded before costs were stored have nothing to preserve, so
-        // estimate them at today's prices and flag the row as an estimate.
-        legacyRows += b.billed.unpriced;
-        const p = priceFor(b.model, override);
-        const c = UsageLedger.cost(b.totals, p);
-        const s = UsageLedger.saved(b.totals, p);
-        if (c !== undefined) { cost = (cost ?? 0) + c; anyPriced = true; estimated = true; }
-        if (s !== undefined) saved = (saved ?? 0) + s;
-      }
-    }
-    const totalIn = agg.input + agg.cacheRead + agg.cacheWrite;
-    const pct = totalIn > 0 ? Math.round((agg.cacheRead / totalIn) * 100) + "%" : "0%";
-    lines.push(cells([label, String(agg.tasks), k(totalIn), pct, k(agg.output),
-                      money(cost), money(saved)]));
+  let allTime = rollUp([], override);
+  for (const [label, since] of windows(now)) {
+    const r = rollUp(ledger.totalsByModel(since) as Band[], override);
+    const totalIn = r.totals.input + r.totals.cacheRead + r.totals.cacheWrite;
+    lines.push(cell([
+      label, String(r.totals.tasks), k(totalIn),
+      totalIn > 0 ? `${Math.round((r.totals.cacheRead / totalIn) * 100)}%` : "0%",
+      k(r.totals.output), money(r.cost), money(r.saved),
+    ]));
+    if (label === "all time") allTime = r;
   }
 
-  if (anyPriced) {
-    const src = readPriceCache();
-    lines.push("");
-    lines.push("cost is what each task was charged when it ran — later price changes don't rewrite it");
-    const age = priceAgeDays();
-    if (src && age !== undefined) {
-      const when = new Date(src.fetchedAt).toISOString().slice(0, 10);
-      lines.push(age > STALE_AFTER_DAYS
-        ? `new tasks priced from rates fetched ${when} (${Math.round(age)} days ago — consider /usage --refresh-prices)`
-        : `new tasks priced from rates fetched ${when}`);
-    } else {
-      lines.push(`new tasks priced from built-in rates, as of ${PRICES_AS_OF} — /usage --refresh-prices for current`);
-    }
-    if (legacyRows) {
-      lines.push(`${legacyRows} older task(s) predate cost tracking${estimated ? " — estimated at today's rates" : ""}`);
-    }
-  } else {
-    lines.push("");
-    lines.push("no price known for this model — set FABER_PRICE_IN / FABER_PRICE_OUT");
+  lines.push("");
+  if (allTime.cost !== undefined && allTime.totals.tasks > 0) {
+    lines.push(pad + `${cents(allTime.cost / allTime.totals.tasks)} per task`);
+  }
+  lines.push(pad + "cached = input reused from cache, billed at ~10%");
+  if (allTime.cost !== undefined && allTime.saved !== undefined && allTime.saved > 0) {
+    lines.push(pad +
+      `saved  = caching cost you ${money(allTime.cost)} instead of ${money(allTime.cost + allTime.saved)}`);
+  }
+  const src = readPriceCache();
+  lines.push(pad + (src
+    ? `rates ${new Date(src.fetchedAt).toISOString().slice(0, 10)} · /usage --refresh-prices`
+    : `built-in rates, as of ${PRICES_AS_OF} · /usage --refresh-prices`));
+  if (allTime.unpriced > 0) {
+    lines.push(pad +
+      `${allTime.unpriced} older task(s) predate cost tracking${allTime.estimated ? ", estimated" : ""}`);
   }
 
-  const others = UsageLedger.allProjects().filter((p) => p.totals.tasks > 0);
-  if (others.length > 1) {
+  // Where the money goes. Only models actually used appear, because this is
+  // built from recorded tasks rather than a catalogue.
+  const byModel = (ledger.totalsByModel(0) as Band[])
+    .filter((b) => b.totals.tasks > 0)
+    .map((b) => {
+      const r = rollUp([b], override);
+      return { model: b.model, totals: r.totals, cost: r.cost };
+    })
+    .sort((a, b) => (b.cost ?? 0) - (a.cost ?? 0));
+
+  if (byModel.length > 1) {
     lines.push("");
-    lines.push("across all projects:");
-    for (const { project, totals: t } of others) {
-      const totalIn = t.input + t.cacheRead + t.cacheWrite;
-      lines.push(cells([
-        "  " + path.basename(project).slice(0, 11), String(t.tasks), k(totalIn),
-        totalIn > 0 ? Math.round((t.cacheRead / totalIn) * 100) + "%" : "0%",
-        k(t.output), "", "",
+    lines.push(cell(["by model", "tasks", "in", "cached", "out", "cost", "per task"]));
+    for (const b of byModel) {
+      const totalIn = b.totals.input + b.totals.cacheRead + b.totals.cacheWrite;
+      lines.push(cell([
+        shortModel(b.model), String(b.totals.tasks), k(totalIn),
+        totalIn > 0 ? `${Math.round((b.totals.cacheRead / totalIn) * 100)}%` : "0%",
+        k(b.totals.output), money(b.cost),
+        b.cost !== undefined ? cents(b.cost / b.totals.tasks) : "—",
       ]));
     }
   }

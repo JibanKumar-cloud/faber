@@ -330,8 +330,10 @@ async function finish(
   // the difference is not small: gpt-4o costs about 17x gpt-4o-mini. Since the
   // credential is saved by now, ask the provider what this key can really use
   // and show each model's rate, so nothing about the bill is implicit.
-  const { refreshPrices, priceFor } = await import("./pricing.js");
+  const { refreshPrices, priceFor, readPriceCache } = await import("./pricing.js");
+  if (!readPriceCache()) process.stdout.write(pc.dim("  fetching prices… "));
   await refreshPrices(undefined, { baseUrl: profile.baseUrl ?? activeRoute.baseUrl });
+  process.stdout.write("\r\x1b[2K");
 
   // Verify the credential before going further. A rejected key means setup
   // did not succeed, so nothing is saved and the next run starts over — the
@@ -345,9 +347,10 @@ async function finish(
     return { profile, route: activeRoute, aborted: true };
   }
 
-  const { isChatModel, sortModels } = await import("./models.js");
+  const { isChatModel, sortModels, requiresUnsupportedApi } = await import("./models.js");
   const discovered = sortModels(
-    (await discoverModels(activeRoute, profile)).filter((m) => isChatModel(m.id)),
+    (await discoverModels(activeRoute, profile))
+      .filter((m) => isChatModel(m.id) && !requiresUnsupportedApi(m.id)),
     activeRoute.wire,
   );
   const fallback = modelsForRoute(activeRoute).map((m) => ({ id: m.id, name: m.blurb }));
@@ -361,8 +364,11 @@ async function finish(
     if (discovered.length) {
       console.log(pc.dim(`  ${discovered.length} models available to this key`));
     } else {
-      console.log(pc.yellow("  Couldn't reach the provider to list models — showing built-in defaults."));
-      console.log(pc.dim("  Your key may be wrong, or you may be offline. /model re-checks later."));
+      const { lastModelListError } = await import("./llm.js");
+      const why = lastModelListError();
+      console.log(pc.yellow("  Couldn't list models — showing built-in defaults."));
+      console.log(pc.dim(why ? `  ${why}` : "  No response from the provider."));
+      console.log(pc.dim("  /model re-checks later."));
     }
     const width = Math.min(34, Math.max(...options.map((m) => m.id.length)) + 2);
     const labels = options.map((m) => {

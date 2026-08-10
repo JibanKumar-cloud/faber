@@ -45,24 +45,87 @@ test("usage: cost and savings use a model's exact cache rates", () => {
   assert.ok(Math.abs(UsageLedger.cost(u, bare)! - (2 + 0.2 + 0.25 + 1)) < 1e-9);
 });
 
-test("usage: panel renders session/today/all-time rows and price hint", () => {
-  const { ledger } = tmpLedger();
-  ledger.record({ input: 27_000, cacheRead: 46_000, cacheWrite: 500, output: 3600, calls: 3 }, "m");
-  const noPrices = renderUsagePanel(ledger);
-  assert.match(noPrices, /this session/);
-  assert.match(noPrices, /today/);
-  assert.match(noPrices, /all time/);
-  assert.match(noPrices, /73\.5k/);                  // total in
-  assert.match(noPrices, /63%/);                     // cache share of input
-  // an unknown model gives no price and says so instead of guessing
-  assert.match(noPrices, /no price known|prices built in/);
-  // an override prices rows that have no recorded cost (and says they're estimates)
-  const priced = renderUsagePanel(ledger, { in: 3, out: 15 });
-  assert.match(priced, /\$0\.\d\d/);
-  assert.match(priced, /charged when it ran/, "the panel states the accounting rule");
-  ledger.close();
+test("usage panel: seven fixed windows, never collapsed, with both columns defined", async () => {
+  const { writePriceCache } = await import("../src/pricing.js");
+  const saved = { home: process.env.HOME, up: process.env.USERPROFILE };
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "faber-panel-"));
+  process.env.HOME = home;
+  process.env.USERPROFILE = home;
+  try {
+    writePriceCache({
+      "gpt-5.3-codex": { in: 2, out: 10, cacheRead: 0.2, cacheWrite: 2.5 },
+      "claude-haiku-4-5": { in: 1, out: 5, cacheRead: 0.1, cacheWrite: 1.25 },
+    }, "test");
+    const { ledger } = tmpLedger();
+    ledger.record({ input: 20000, cacheRead: 40000, cacheWrite: 500, output: 900, calls: 2 },
+      "gpt-5.3-codex");
+    ledger.record({ input: 5000, cacheRead: 9000, cacheWrite: 100, output: 200, calls: 1 },
+      "claude-haiku-4-5");
+    const panel = renderUsagePanel(ledger);
+
+    // Every window is present even though they all hold the same data. A
+    // missing row would read as "no data" rather than "nothing new since".
+    for (const w of ["today", "last 7 days", "last 14 days", "last 30 days",
+                     "last 3 months", "last 6 months", "all time"]) {
+      assert.ok(panel.includes(w), `missing window: ${w}`);
+    }
+    assert.equal(panel.split("\n").filter((l) => l.startsWith("all time")).length, 1);
+
+    // The two columns nobody can interpret unaided are explained.
+    assert.match(panel, /cached = input reused from cache/);
+    assert.match(panel, /saved  = caching cost you \$\d+\.\d\d instead of \$\d+\.\d\d/);
+    assert.match(panel, /per task/);
+    assert.match(panel, /\/usage --refresh-prices/);
+
+    // by-model lists only models actually used, dearest first
+    assert.match(panel, /by model/);
+    // names are shortened for the column: "claude-haiku-4-5" -> "haiku-4-5"
+    const codexAt = panel.indexOf("gpt-5.3-codex");
+    const haikuAt = panel.indexOf("haiku-4-5");
+    assert.ok(codexAt > 0 && haikuAt > 0, "both used models appear");
+    assert.ok(codexAt < haikuAt, "the expensive model is listed first");
+    assert.ok(!panel.includes("gpt-4o"), "a model never used must not appear");
+    ledger.close();
+  } finally {
+    process.env.HOME = saved.home;
+    process.env.USERPROFILE = saved.up;
+  }
 });
 
+test("usage panel: a window shows only tasks inside it", async () => {
+  const { writePriceCache } = await import("../src/pricing.js");
+  const saved = { home: process.env.HOME, up: process.env.USERPROFILE };
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "faber-win-"));
+  process.env.HOME = home;
+  process.env.USERPROFILE = home;
+  try {
+    writePriceCache({ m: { in: 1, out: 2 } }, "test");
+    const { ledger, dir } = tmpLedger();
+    ledger.record({ input: 100, cacheRead: 0, cacheWrite: 0, output: 10, calls: 1 }, "m");
+    ledger.close();
+
+    // backdate that task by 45 days
+    const { DatabaseSync } = require("node:sqlite") as typeof import("node:sqlite");
+    const db = new DatabaseSync(path.join(dir, "usage.db"));
+    db.prepare("UPDATE tasks SET ts = ?").run(Date.now() - 45 * 86_400_000);
+    db.close();
+
+    const reopened = new UsageLedger(path.join(dir, "usage.db"), dir);
+    reopened.record({ input: 50, cacheRead: 0, cacheWrite: 0, output: 5, calls: 1 }, "m");
+    const panel = renderUsagePanel(reopened);
+    const row = (label: string): string =>
+      panel.split("\n").find((l) => l.startsWith(label)) ?? "";
+
+    assert.match(row("today"), /^today\s+1\s/, "only the new task is inside today");
+    assert.match(row("last 30 days"), /^last 30 days\s+1\s/, "the 45-day-old one is outside");
+    assert.match(row("last 3 months"), /^last 3 months\s+2\s/, "and inside three months");
+    assert.match(row("all time"), /^all time\s+2\s/);
+    reopened.close();
+  } finally {
+    process.env.HOME = saved.home;
+    process.env.USERPROFILE = saved.up;
+  }
+});
 test("usage: a recorded cost is immutable — later price changes never rewrite history", async () => {
   const { priceFor } = await import("../src/pricing.js");
   const { writePriceCache } = await import("../src/pricing.js");

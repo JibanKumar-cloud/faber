@@ -14,6 +14,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { modelsForRoute, type ModelChoice, type Route } from "./routes.js";
+import { priceFor } from "./pricing.js";
 
 export interface DiscoveredModel { id: string; name?: string; created?: number; }
 
@@ -86,7 +87,29 @@ const NOT_CHAT = /(^|[-_/])(embedding|embed|tts|whisper|moderation|dall-e|dalle|
 const LEGACY = /^(davinci|babbage|curie|ada|text-davinci|code-davinci)/i;
 
 export function isChatModel(id: string): boolean {
+  // The dataset states each model's mode and endpoints, so use that rather
+  // than reading the name. Guessing from an id misclassifies every new naming
+  // scheme; this is the provider's own answer, refreshed on every launch.
+  const p = priceFor(id);
+  // "responses" counts as a chat model now that Faber speaks that API too.
+  if (p?.mode) return p.mode === "chat" || p.mode === "completion" || p.mode === "responses";
+  if (p?.endpoints?.length) {
+    return p.endpoints.some((e) => e.includes("chat/completions") || e === "/v1/responses");
+  }
+  // Only fall back to name-based rules when the dataset has never seen it,
+  // which is the case for a brand new model or a local one.
   return !NOT_CHAT.test(id) && !LEGACY.test(id);
+}
+
+/**
+ * Does this model need an API Faber doesn't speak? The dataset records it —
+ * gpt-5.3-codex reports mode "responses" and endpoint /v1/responses — so
+ * these can be labelled honestly instead of failing at request time.
+ */
+export function requiresUnsupportedApi(_id: string): string | undefined {
+  // Responses-only models are supported now, so nothing is excluded on this
+  // basis. Kept as the hook for the next API Faber doesn't yet speak.
+  return undefined;
 }
 
 export interface PickerEntry {
@@ -114,9 +137,13 @@ export function buildPicker(
     live: false,
   }));
   const covered = new Set(aliases.map((a) => a.id));
+  const unusable = readUnusable();
   for (const m of sortModels(discovered, route.wire)) {
     if (covered.has(m.id)) continue;
     if (!isChatModel(m.id)) continue;   // embeddings, speech, moderation…
+    // Only genuinely dead models are hidden. An endpoint mismatch is handled
+    // by retrying on the right endpoint, so it must not remove the model.
+    if (unusable[m.id] === "deprecated") continue;
     entries.push({ value: m.id, label: m.id, blurb: m.name ?? "", live: true });
   }
   // if the model in use is neither an alias nor discovered, keep it visible
@@ -124,4 +151,57 @@ export function buildPicker(
     entries.push({ value: currentId, label: currentId, blurb: "current", live: false });
   }
   return entries;
+}
+
+// ───────────────────────────────────────── models known not to work
+/**
+ * Providers don't tell us which models are dead.
+ *
+ * Bedrock exposes a lifecycle field, but OpenAI's /v1/models happily lists
+ * retired models and says nothing about which endpoint a model needs. The
+ * only reliable signal is the request that fails, so Faber remembers those:
+ * a model that reports itself deprecated, or that needs an API Faber doesn't
+ * speak, is hidden from later menus instead of being offered again.
+ *
+ * Learned from live responses rather than a hardcoded list, so it stays
+ * correct as providers retire things without shipping a Faber update.
+ */
+export type Unusable = "deprecated" | "wrong-endpoint";
+
+function unusableFile(): string {
+  return path.join(os.homedir(), ".faber", "cache", "unusable-models.json");
+}
+
+export function readUnusable(): Record<string, Unusable> {
+  try {
+    const raw = JSON.parse(fs.readFileSync(unusableFile(), "utf8")) as Record<string, Unusable>;
+    return raw && typeof raw === "object" ? raw : {};
+  } catch {
+    return {};
+  }
+}
+
+export function markUnusable(modelId: string, why: Unusable): void {
+  try {
+    const f = unusableFile();
+    fs.mkdirSync(path.dirname(f), { recursive: true });
+    fs.writeFileSync(f, JSON.stringify({ ...readUnusable(), [modelId]: why }, null, 2));
+  } catch { /* best effort */ }
+}
+
+export function clearUnusable(): void {
+  try { fs.unlinkSync(unusableFile()); } catch { /* already gone */ }
+}
+
+/** Classify a provider error, so a failure teaches us something. */
+export function classifyModelError(message: string): Unusable | undefined {
+  const m = message.toLowerCase();
+  if (m.includes("deprecat") || m.includes("model_not_found") || m.includes("has been retired")) {
+    return "deprecated";
+  }
+  if (m.includes("/v1/responses") || m.includes("responses endpoint")
+      || m.includes("not supported in the v1/chat/completions")) {
+    return "wrong-endpoint";
+  }
+  return undefined;
 }

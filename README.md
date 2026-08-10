@@ -1,7 +1,4 @@
 # Faber
-[![npm](https://img.shields.io/npm/v/faberwright)](https://www.npmjs.com/package/faberwright)
-[![license](https://img.shields.io/npm/l/faberwright)](./LICENSE)
-[![node](https://img.shields.io/node/v/faberwright)](https://nodejs.org)
 
 **An agentic AI coding assistant for your terminal.** Give it a task in plain English; it explores your repository, edits files with your approval, runs your tests, and remembers your project across sessions.
 
@@ -46,17 +43,15 @@ That loop of task, approve, inspect, revert is the whole trust model. Everything
 
 **It has a map, not just eyes.** The code graph stores call and import *edges*, incrementally updated in milliseconds. One ~50-token query (`trace_path(main, saveUser)` → `main → startServer → handleSignup → saveUser`) replaces reading thousands of tokens of files. `/map main` prints the call tree — the "trace it from main" ritual every programmer does, automated.
 
-**It's honest about money.** Prompt caching marks the stable prefix of every request, so repeat loop iterations pay ~10% for tokens already sent. And after every task you see exactly what happened: `tokens: 31.2k in (78% cached) / 1.9k out · 7 calls`.
+**Every model you can reach, including the coding ones.** Claude through the Anthropic API or your own AWS account, OpenAI through both of its APIs — chat completions and the Responses API that the codex family requires — plus anything OpenAI-compatible, and local models through Ollama for no key and no cost. Faber reads which endpoint each model needs and routes there itself, so `gpt-5.3-codex` and `claude-opus-5` are both just entries in the same list, priced side by side.
+
+**It's honest about money.** Prompt caching marks the stable prefix of every request, so repeat loop iterations pay ~10% for tokens already sent. Every task is costed and recorded as it runs, so `/usage` is a ledger of what you actually spent rather than an estimate — broken down by time window and by model, with the cheapest option always visible next to the one you're using.
 
 **Nothing is irreversible.** Every task is checkpointed before it touches a file. Undo is undoable. Approvals gate both edits *and* shell commands. Rejecting a change tells the model to change course, not retry.
 
 **It remembers.** Facts, decisions, and gotchas persist per-project in SQLite. Sessions survive crashes (append-only JSONL). New sessions start with a digest of the last one, and the agent searches past conversations when you reference them.
 
 **You can steer it mid-flight.** See it going the wrong way? Just type `use TypeScript, not JavaScript` — and your guidance is injected at the next loop iteration. No cancelling, no wasted tokens.
-
-## Upgrading from Codewright
-
-Faber is Codewright renamed, after the npm name was taken between building and releasing. Existing projects keep working untouched: an existing `.codewright/` state directory is adopted as-is, so memory, code graph, sessions, and usage history all survive. `CW_*` environment variables still work alongside the canonical `FABER_*` names. New projects get `.faber/`.
 
 ## Requirements & install
 
@@ -111,17 +106,10 @@ Setup is skipped entirely when there's no terminal attached, so scripts and CI n
 
 ## Features
 
-| | |
+| Feature|Description |
 |---|---|
 | **Streaming agent loop** | Text renders as generated, with a live heartbeat (`✳ Working… 14s`) that never interleaves with output and ends in `✳ Worked for 14s`. Plan → tool → observe → adjust, until done. Hard iteration cap. |
 | **Code graph** | Symbols *and* call/import edges, incrementally maintained (only changed files re-parse). Agent tools: `who_calls` (blast radius), `calls_from` (dependencies), `trace_path` (workflow chain). A compact repo map of the most-connected symbols orients every task. Edges are static hints — dynamic dispatch/DI/events aren't captured; the agent reads code where precision matters. |
-| **Approval by default** | Arrow-key menu on every file edit (colored diff) and every shell command. `--auto` / `/auto` / `FABER_APPROVAL=auto` opts into autonomy. |
-| **Guided setup** | First run walks through vendor, route, credential and model, then remembers it. Later launches verify the setup can reach a model before opening the prompt. Nothing is saved until setup finishes, so an interrupted run leaves no half-configured state. |
-| **Credentials** | Keys live in `~/.faber/credentials.json`, owner-only, outside every repository. Faber checks that what you paste looks like a key before storing it, hides it as you type, and never prints more than a masked fragment. Environment variables keep working and take precedence. |
-| **Interactive choices** | Genuinely ambiguous request? The agent presents 2–4 options plus "Chat more about this instead" before writing code. |
-| **Mid-task steering** | Type while it works; guidance is injected at the next loop boundary. If the model finishes while steering is queued, the task continues instead. Steering markers carry a per-task nonce, so hostile file contents can't impersonate you. |
-| **Paste as chips** | Raw-mode composer: pasting a 50-line block renders only a chip — `[pasted #1 +50 lines]` — never the code itself, while the full text is expanded into the message on Enter. Paste the same block again to expand it visibly. Paste, type, paste again: one submission. Full line editing: arrows, Home/End, forward-delete, Ctrl-A/E/K/U, Up/Down history; long drafts wrap across rows with exact cursor tracking — backspace and arrows travel across wrap boundaries. Chips are atomic — one arrow step, one backspace.  Works at the prompt and while steering. |
-| **Reversible history** | `/history` lists tasks with files touched; `/restore <id>` jumps anywhere; `/undo` / `/redo` — restores are never destructive. |
 | **Git-aware** | Warns about uncommitted changes at startup. Optional `FABER_GIT=commit`: one commit per completed *task* (never per edit). The agent never commits by default. |
 | **Two-layer memory** | Short-term: token-budgeted window, auto-summarized past 60k (tool pairs never split). Long-term: SQLite+FTS5 facts/decisions/gotchas + per-file notes, with full lifecycle (`/forget`, `/archive`, `/prune`). |
 | **Sessions** | Crash-safe JSONL transcripts; `--resume`; last-session digest injected at startup; `recall_sessions` keyword search across history. |
@@ -131,6 +119,11 @@ Setup is skipped entirely when there's no terminal attached, so scripts and CI n
 | **Usage dashboard** | `/usage` shows a persistent ledger: tasks, tokens, cache rate, cost, and cache *savings* — for this session, today, and all time, plus totals across every project on the machine. Costs use each model's own rates, including its exact cache read/write prices, so a history spanning a model switch stays accurate. Prices ship built in and update with `/usage --refresh-prices`. Records live in `.faber/usage.db` per project and survive restarts. |
 | **Error recovery** | Transient API errors: backoff + jitter, honors Retry-After. Tool errors return to the model to self-correct. Identical call failing twice → warning; three times → clean abort. Ctrl-C aborts streams *and* running commands; checkpoints survive. |
 | **Safety rails** | Symlink-resolved path jail, shell denylist, timeouts, output truncation, atomic writes (temp+rename), stale-edit guard. Guardrails, not a sandbox — use a container for untrusted code. |
+| **Approval by default** | Arrow-key menu on every file edit (colored diff) and every shell command. `--auto` / `/auto` / `FABER_APPROVAL=auto` opts into autonomy. |
+| **Guided setup** | First run walks through vendor, route, credential and model, then remembers it. Later launches verify the setup can reach a model before opening the prompt. Nothing is saved until setup finishes, so an interrupted run leaves no half-configured state. |
+| **Credentials** | Keys live in `~/.faber/credentials.json`, owner-only, outside every repository. Faber checks that what you paste looks like a key before storing it, hides it as you type, and never prints more than a masked fragment. Environment variables keep working and take precedence. |
+| **Mid-task steering** | Type while it works; guidance is injected at the next loop boundary. If the model finishes while steering is queued, the task continues instead. Steering markers carry a per-task nonce, so hostile file contents can't impersonate you. |
+| **Reversible history** | `/history` lists tasks with files touched; `/restore <id>` jumps anywhere; `/undo` / `/redo` — restores are never destructive. |
 
 ## Vendors, routes, and models
 
@@ -140,9 +133,11 @@ Faber separates three choices, so you can change one without redoing the others:
 |---|---|---|
 | **Vendor** | who makes the model | `/route` |
 | **Route** | how you reach it and who owns auth | `/route` |
-| **Model** | which model on that route | `/model` |
+| **Model** | which model on that route | `/model` (searchable model options) |
 
-Routes available today: **Anthropic API**, **Amazon Bedrock**, **OpenAI API**, **Ollama** (local, no key and no cost), and any **OpenAI-compatible endpoint** (OpenRouter, Groq, Together, vLLM, a gateway). Google Vertex is defined but not yet wired up — `/route` says so rather than failing at request time.
+Routes available today: **Anthropic API**, **Amazon Bedrock**, **OpenAI API**, **Ollama** (local, no key and no cost), and any **OpenAI-compatible endpoint** (OpenRouter, Groq, Together, vLLM, a gateway). Google Vertex is defined but not yet wired up, and `/route` says so rather than failing at request time.
+
+On OpenAI, Faber speaks both APIs. Chat completions for most models, and the **Responses API** for the ones that require it, which includes the codex family — the coding-tuned models a coding agent actually wants. You don't choose: each model's endpoint is recorded in the price dataset Faber already downloads, so `gpt-5.3-codex` routes to `/v1/responses` and `gpt-5.5` to `/v1/chat/completions` automatically. If a model is too new to appear in that dataset and the API says it belongs elsewhere, Faber retries on the endpoint it names rather than failing.
 
 ### Amazon Bedrock
 
@@ -166,17 +161,39 @@ Model ids on Bedrock differ by region and deployment, so pin them per alias in y
 
 ### Costs
 
-`/usage` shows real dollars without any configuration. Prices come from the best source available, in this order: whatever you set explicitly, then the provider's own published rates (OpenRouter publishes per-token prices including cache reads and writes, and needs no key for it), then a community dataset covering everyone else, then a small table built into Faber so it still works offline. Anthropic and OpenAI don't publish prices through their APIs at all, which is why the last two exist.
+`/usage` is a ledger, not an estimate. Every task's cost is worked out and written down when the task runs, at the rates in effect then, and never recalculated. If a vendor raises prices next month, last month's tasks still show what they actually cost.
+
+`/usage` breaks spend down across seven rolling windows — today, 7 days, 14 days, 30 days, 3 months, 6 months, all time — each showing tasks, tokens, cache rate, cost and savings, with a per-model table underneath showing where the money actually goes.
+
+Windows are rolling rather than calendar, so "last 30 days" always means thirty days instead of resetting to one on the first of the month. All seven are shown even when they hold identical numbers: a missing row would read as "no data" when it actually means "nothing new since," and that distinction is the whole point for someone coming back after a break.
+
+The two columns nobody can interpret unaided are defined in the panel itself. **Cached** is the share of input served from a cache rather than billed at full price. **Saved** is the counterfactual: what those same tasks would have cost without prompt caching. The by-model table is the actionable part, since switching routine work to a cheaper model is usually the largest saving available.
+
+**Where prices come from**, best source first: whatever you set explicitly, then the provider's own published rates (OpenRouter publishes per-token prices including cache reads and writes, and needs no key for it), then a community dataset covering everyone else, then a small table built into Faber so it works offline. Anthropic and OpenAI don't publish prices through their APIs at all, which is why the last two exist.
+
+Keeping those rates current matters more than it sounds, precisely because costs are frozen when recorded: a stale table would bake a wrong number into your history permanently. So Faber fetches prices during setup and re-checks on every launch with a conditional request. When nothing has changed the server answers `304` with no body — about 70ms in the background — so there's no window where an out-of-date rate can enter your records. The full download happens only when the list actually changes, and after a failed attempt Faber waits a day before retrying so an offline machine isn't making a doomed request on every start.
+
+Turn the automatic refresh off with `FABER_AUTO_PRICES=0` or `"autoRefreshPrices": false` in your profile. This is the only network request Faber makes that isn't an inference call; it fetches a public price list and sends nothing about you.
+
+Costs use each model's own input, output, cache-read and cache-write rates rather than a flat multiplier, and cloud model ids like `us.anthropic.claude-sonnet-5` normalise onto the same entry as the direct one. `FABER_PRICE_IN` and `FABER_PRICE_OUT`, or `priceIn` and `priceOut` in a profile, override everything. A model with no known price shows a dash rather than a guess.
+
+**What gets recorded.** One row per task in `<project>/.faber/usage.db`:
 
 ```
-faber> /usage --refresh-prices     # pull current rates now
+ts           1785979475047     when it ran
+input        27000             fresh input tokens
+cache_read   46000             served from cache
+cache_write  500               stored into the cache for reuse
+output       3600              generated
+calls        3                 API round-trips inside that task
+model        gpt-5.3-codex     which model ran it
+cost         0.0412            dollars, frozen at run time
+saved        0.0231            what caching avoided
 ```
 
-Keeping those rates current matters more than it might sound, because a task's cost is written down when the task runs and never recalculated. If a vendor raises prices next month, last month's tasks still show what they actually cost. That's the point of a ledger. But it also means a stale price table would bake a wrong number into your history permanently, so Faber fetches prices once during setup and re-checks on every launch using a conditional request. When nothing has changed the server answers with a 304 and no body, which costs about 70ms in the background, so there's no window where an out-of-date rate can slip into your records. The full download only happens when the price list actually changes, and after a failed attempt Faber waits a day before trying again so an offline machine isn't making a doomed request every time you start.
+Counters and a timestamp. No prompts, no code, no file contents. Around 80 bytes a row, so a year of heavy use is roughly a megabyte, and nothing is ever pruned.
 
-You can turn the automatic refresh off with `FABER_AUTO_PRICES=0` or `"autoRefreshPrices": false` in your profile, in which case Faber falls back to its built-in rates and mentions at startup when they're getting old. This is the only network request Faber makes that isn't an inference call. It fetches a public price list and sends nothing about you.
-
-Costs use each model's own input, output, cache-read and cache-write rates rather than a flat multiplier, and cloud model ids like `us.anthropic.claude-sonnet-5` normalize onto the same entry as the direct one. Setting `FABER_PRICE_IN` and `FABER_PRICE_OUT`, or `priceIn` and `priceOut` in a profile, overrides everything. A model with no known price shows a dash rather than a guess.
+Keeping the raw rows rather than rolling them into running totals is deliberate: any question you think of later can still be answered about the past. Spend for a particular month, which model a given week ran on, cost per task before and after a prompt change. It's a plain SQLite file, so `sqlite3 .faber/usage.db` will answer anything Faber doesn't print — including an expense report of your own shape.
 
 Settings live in `~/.faber/settings.json` as named **profiles**:
 
@@ -199,10 +216,10 @@ Settings resolve in this order, highest first: environment variables, then a pro
 ```
 /setup              run setup again (vendor, route, credential, model)
 /route              choose a vendor and route
-/model [alias]      switch model; lists what your key can actually use
+/model [id]         switch model; lists what your key can use, with prices
 /key [set|rm]       show, save or remove an API key
 /profile [name]     list or switch saved profiles
-/usage              tokens, cost and cache savings (--refresh-prices)
+/usage              cost ledger by time window and model (--refresh-prices)
 /index              rebuild the code graph (symbols + call edges)
 /map <symbol>       print the call tree from any entry point
 /memory [archived]  long-term memories (+ file notes)
@@ -242,9 +259,9 @@ Faber keeps three files. `~/.faber/settings.json` holds your profiles, which is 
 
 Commit protection happens on its own. When Faber starts inside a git repo it writes `.faber/` into `.git/info/exclude`, a local ignore that produces no diff and is never committed, so project state can't reach GitHub even if you forget your `.gitignore`. If `.faber/` was already committed at some point in the past, you get a loud warning with the exact `git rm --cached` command to fix it. This matters because sessions and checkpoints can contain the contents of files the agent read. If teammates will use Faber too, add `.faber/` to the shared `.gitignore` so they're covered from their first run.
 
-## Failure-mode matrix
+## What happens when things go wrong
 
-| Failure | Behavior |
+| Situation | What Faber does |
 |---|---|
 | API 429/5xx/network drop | retry with backoff+jitter; Retry-After honored; clear fatal after N attempts |
 | Bad API key | immediate fatal naming the env var to set |
@@ -269,7 +286,7 @@ npm test          # offline test suite, no API key needed
 node selftest.mjs # installation self-check + live agent verification (report file to share)
 ```
 
-The suite deliberately covers the awkward cases rather than the easy ones: undo and redo round-trips, checkpoint ids colliding within the same millisecond, session files torn mid-write, cyclic call graphs, surgical edits through CRLF and emoji, cancellation mid-stream, steering messages keeping the API's role alternation valid, paste markers split across stream chunks, AWS signatures checked against the vector AWS publishes, credential files landing with owner-only permissions, and a recorded cost staying put when prices later change. Several tests drive the real agent loop against a mock streaming server, and one drives the actual CLI binary.
+The suite deliberately covers the awkward cases rather than the easy ones: undo and redo round-trips, checkpoint ids colliding within the same millisecond, session files torn mid-write, cyclic call graphs, surgical edits through CRLF and emoji, cancellation mid-stream, steering messages keeping the API's role alternation valid, paste markers split across stream chunks, AWS signatures checked against the vector AWS publishes, credential files landing with owner-only permissions, a recorded cost staying put when prices later change, Responses-API tool calls assembled from their argument deltas, and usage windows that put a 45-day-old task in "last 3 months" but not "last 30 days". Several tests drive the real agent loop against a mock streaming server, and one drives the actual CLI binary.
 
 CI runs on Ubuntu, macOS and Windows across Node 22 and 24: tests, build, and CLI smoke on every push.
 
@@ -280,18 +297,21 @@ CLI/REPL (index.ts)   streaming render · arrow-key approvals · steering captur
    │
 Agent loop (agent.ts) recall memory + repo map → [LLM ⇄ tools] → verify → summarize
    │                  doom-loop breaker · iteration cap · compaction · session log · steering drain
-   ├─ LLM (llm.ts)            Anthropic + OpenAI-compatible · SSE streaming · prompt caching · usage · retry
+   ├─ LLM (llm.ts)            three wires: Anthropic · OpenAI chat · OpenAI Responses · SSE · caching · retry
+   ├─ Routes (routes.ts)      vendor → route → model · SigV4 for Bedrock (sigv4.ts) · live model discovery
+   ├─ Pricing (pricing.ts)    per-model rates, modes and endpoints · conditional refresh · frozen at spend
    ├─ Tools (tools/)          validated dispatch · mutations staged as diffs · shell gated by approval
    ├─ Graph (indexer.ts)      symbols + call/import edges · incremental · who_calls / trace_path / map
    ├─ Memory (memory/)        shortTerm (window+compaction) · longTerm (SQLite+FTS) · sessions (JSONL)
    └─ Checkpoints             snapshot-before-write · /history · reversible restore
 
-All state in <repo>/.faber/   (memory.db, index.db, sessions/, checkpoints/)
+Per project  <repo>/.faber/    memory.db · index.db · usage.db · sessions/ · checkpoints/
+Per machine  ~/.faber/          settings.json (profiles) · credentials.json (0600) · cache/
 ```
 
 ## Roadmap
 
-Google Vertex is defined but not yet wired up, since its OAuth flow is a bigger piece than Bedrock turned out to be. Beyond that: tree-sitter for compiler-grade graph edges, evicting stale tool results from long conversations, redacting secrets in session logs, team-shared project settings that can live in a repo, embedding-based recall, a branch-per-task git mode, and a VS Code extension built on this core.
+Google Vertex is defined but not yet wired up, since its OAuth flow is a bigger piece than Bedrock turned out to be. Beyond that: tree-sitter for compiler-grade graph edges, evicting stale tool results from long conversations, redacting secrets in session logs, team-shared project settings that can live in a repo, embedding-based recall, a branch-per-task git mode, a `/usage --all` view comparing every project on the machine, and a VS Code extension built on this core.
 
 ## License
 

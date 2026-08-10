@@ -26,6 +26,14 @@ export interface ModelPrice {
   out: number;
   cacheRead?: number;    // reading a cached prefix
   cacheWrite?: number;   // storing one (charged once, at a premium)
+  /**
+   * What kind of model this is: "chat", "embedding", "responses", and so on.
+   * The dataset knows this, which is far better than inferring it from the
+   * model's name — a guess that gets a new naming scheme wrong every time.
+   */
+  mode?: string;
+  /** Endpoints the model serves, e.g. ["/v1/responses"]. */
+  endpoints?: string[];
 }
 
 /** Verified 2026-08. Check the vendor's pricing page before quoting these. */
@@ -62,7 +70,17 @@ function cacheFile(): string {
   return path.join(os.homedir(), ".faber", "cache", "prices.json");
 }
 
+/**
+ * Bumped whenever the cached shape gains a field Faber relies on. A cache
+ * written by an older version is discarded rather than trusted: after adding
+ * `mode` and `supported_endpoints`, a stale file looked complete but carried
+ * neither, so Responses-only models were routed to the wrong endpoint and
+ * failed with a 404 that looked like a Faber bug.
+ */
+export const PRICE_CACHE_VERSION = 2;
+
 interface PriceCache {
+  version?: number;
   fetchedAt: number;      // when the prices were last CONFIRMED current
   source: string;
   prices: Record<string, ModelPrice>;
@@ -90,7 +108,9 @@ export function pricesAreStale(now = Date.now()): boolean {
 export function readPriceCache(): PriceCache | undefined {
   try {
     const raw = JSON.parse(fs.readFileSync(cacheFile(), "utf8")) as PriceCache;
-    return raw.prices && typeof raw.prices === "object" ? raw : undefined;
+    if (!raw.prices || typeof raw.prices !== "object") return undefined;
+    if ((raw.version ?? 1) < PRICE_CACHE_VERSION) return undefined;   // stale shape
+    return raw;
   } catch {
     return undefined;
   }
@@ -104,7 +124,8 @@ export function writePriceCache(
     fs.mkdirSync(path.dirname(f), { recursive: true });
     const now = Date.now();
     fs.writeFileSync(f, JSON.stringify(
-      { fetchedAt: now, lastAttempt: now, source, etag, prices }, null, 2));
+      { version: PRICE_CACHE_VERSION, fetchedAt: now, lastAttempt: now, source, etag, prices },
+      null, 2));
   } catch { /* best effort */ }
 }
 
@@ -129,6 +150,7 @@ export function markRefreshAttempt(now = Date.now()): void {
     fs.mkdirSync(path.dirname(f), { recursive: true });
     const existing = readPriceCache();
     fs.writeFileSync(f, JSON.stringify({
+      version: PRICE_CACHE_VERSION,
       fetchedAt: existing?.fetchedAt ?? 0,
       lastAttempt: now,
       source: existing?.source ?? "none",
@@ -248,6 +270,9 @@ export async function refreshPrices(
       // and these values get written to a file people read.
       const perM = (n: number): number => Math.round(n * 1e6 * 1e6) / 1e6;
       const price: ModelPrice = { in: perM(inC), out: perM(outC) };
+      if (typeof v["mode"] === "string") price.mode = v["mode"];
+      const eps = v["supported_endpoints"];
+      if (Array.isArray(eps)) price.endpoints = eps.filter((e): e is string => typeof e === "string");
       const cr = v["cache_read_input_token_cost"], cw = v["cache_creation_input_token_cost"];
       if (typeof cr === "number") price.cacheRead = perM(cr);
       if (typeof cw === "number") price.cacheWrite = perM(cw);
