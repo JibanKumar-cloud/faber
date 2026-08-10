@@ -19,7 +19,7 @@ import * as fs from "node:fs";
 import { loadSettings, saveSettings, settingsPath, type Profile } from "./settings.js";
 import {
   credentialSource, saveCredential, maskCredential, credentialsPath, getCredential,
-  looksLikeKey,
+  looksLikeKey, deleteCredential,
 } from "./credentials.js";
 
 /** First run = no settings file yet. */
@@ -169,7 +169,30 @@ export async function ensureCredential(
   const found = credentialSource(route.keyEnv);
 
   if (found?.from === "store") {
-    console.log(pc.dim(`  Using ${route.keyEnv} saved on this computer (${maskCredential(found.value)})`));
+    // Running setup again usually means something needs changing — often the
+    // key itself, because it expired or was wrong. Silently reusing the saved
+    // one makes that impossible, so offer the same choice as for an
+    // environment key.
+    console.log();
+    console.log(`${route.keyEnv} is already saved on this computer (${maskCredential(found.value)}).`);
+    const choice = await select(rl, "Use it?", [
+      `Keep using it                    ${pc.dim("no change")}`,
+      `Replace it                       ${pc.dim("paste a new key")}`,
+      `Remove it                        ${pc.dim("delete the saved key and stop")}`,
+    ]);
+    if (choice === 1) {
+      const key = await readKey(rl, route.keyEnv, `  ${route.keyEnv} (hidden): `);
+      if (key) {
+        saveCredential(route.keyEnv, key);
+        console.log(pc.dim(`  replaced (${maskCredential(key)})`));
+      } else {
+        console.log(pc.dim("  nothing entered — keeping the saved key"));
+      }
+    } else if (choice === 2) {
+      deleteCredential(route.keyEnv);
+      console.log(pc.dim(`  removed. Run faber again to set one up.`));
+      return { switchedTo: "quit" };
+    }
     return {};
   }
 
@@ -228,6 +251,53 @@ export async function ensureCredential(
   return { switchedTo: "quit" };
 }
 
+/** Does the provider accept this credential? Never blocks on being offline. */
+async function verifyCredential(
+  route: Route, profile: Profile,
+): Promise<"ok" | "rejected" | "unreachable"> {
+  if (!route.keyEnv) return "ok";
+  try {
+    const { LLMClient } = await import("./llm.js");
+    const { resolveCredential } = await import("./credentials.js");
+    const key = resolveCredential(route.keyEnv);
+    const baseUrl = profile.baseUrl ?? baseUrlFor(route, profile.region);
+    if (!key || !baseUrl) return "unreachable";
+    process.stdout.write(pc.dim("  checking your key… "));
+    const llm = new LLMClient({
+      provider: route.wire, baseUrl, apiKey: key, model: "x", route: route.id,
+    } as unknown as import("./config.js").Config);
+    const verdict = await llm.verifyKey();
+    process.stdout.write("\r\x1b[2K");
+    return verdict;
+  } catch {
+    process.stdout.write("\r\x1b[2K");
+    return "unreachable";
+  }
+}
+
+/** Ask the provider which models this key can use. Empty on any failure. */
+async function discoverModels(
+  route: Route, profile: Profile,
+): Promise<{ id: string; name?: string }[]> {
+  try {
+    const { LLMClient } = await import("./llm.js");
+    const { resolveCredential } = await import("./credentials.js");
+    const key = route.keyEnv ? resolveCredential(route.keyEnv) : undefined;
+    const baseUrl = profile.baseUrl ?? baseUrlFor(route, profile.region);
+    if (!baseUrl) return [];
+    process.stdout.write(pc.dim("  checking which models your key can use… "));
+    const llm = new LLMClient({
+      provider: route.wire, baseUrl, apiKey: key, model: "x", route: route.id,
+    } as unknown as import("./config.js").Config);
+    const models = await llm.listModels();
+    process.stdout.write("\r\x1b[2K");
+    return models;
+  } catch {
+    process.stdout.write("\r\x1b[2K");
+    return [];
+  }
+}
+
 async function finish(
   rl: readline.Interface,
   route: Route,
@@ -254,30 +324,62 @@ async function finish(
     }
   }
 
-  // model: pick from aliases, or ask for an id on routes where ids vary
-  const choices = modelsForRoute(activeRoute);
-  if (choices.length) {
-    const mi = await select(
-      rl,
-      "Default model",
-      choices.map((m) => `${m.alias.padEnd(8)} ${pc.dim(m.blurb)}`),
-    );
-    profile.model = choices[mi]!.alias;
+  // Model choice, with real ids and real prices.
+  //
+  // Aliases like "gpt" or "sonnet" hide what you're actually paying for, and
+  // the difference is not small: gpt-4o costs about 17x gpt-4o-mini. Since the
+  // credential is saved by now, ask the provider what this key can really use
+  // and show each model's rate, so nothing about the bill is implicit.
+  const { refreshPrices, priceFor } = await import("./pricing.js");
+  await refreshPrices(undefined, { baseUrl: profile.baseUrl ?? activeRoute.baseUrl });
+
+  // Verify the credential before going further. A rejected key means setup
+  // did not succeed, so nothing is saved and the next run starts over — the
+  // same rule as skipping the key entirely.
+  const verdict = await verifyCredential(activeRoute, profile);
+  if (verdict === "rejected") {
+    if (activeRoute.keyEnv) deleteCredential(activeRoute.keyEnv);
+    console.log();
+    console.log(pc.yellow(`${activeRoute.label} rejected that key.`));
+    console.log(pc.dim("  Nothing was saved. Run faber again with a working key."));
+    return { profile, route: activeRoute, aborted: true };
+  }
+
+  const { isChatModel, sortModels } = await import("./models.js");
+  const discovered = sortModels(
+    (await discoverModels(activeRoute, profile)).filter((m) => isChatModel(m.id)),
+    activeRoute.wire,
+  );
+  const fallback = modelsForRoute(activeRoute).map((m) => ({ id: m.id, name: m.blurb }));
+  const options = discovered.length ? discovered : fallback;
+
+  if (options.length) {
+    // Say which list this is. A built-in fallback and a live list look
+    // identical otherwise, and the user can't tell whether the models shown
+    // are the ones their key can actually reach.
+    console.log();
+    if (discovered.length) {
+      console.log(pc.dim(`  ${discovered.length} models available to this key`));
+    } else {
+      console.log(pc.yellow("  Couldn't reach the provider to list models — showing built-in defaults."));
+      console.log(pc.dim("  Your key may be wrong, or you may be offline. /model re-checks later."));
+    }
+    const width = Math.min(34, Math.max(...options.map((m) => m.id.length)) + 2);
+    const labels = options.map((m) => {
+      const p = priceFor(m.id);
+      const cost = p ? `$${p.in}/$${p.out} per Mtok` : "price unknown";
+      return `${m.id.padEnd(width)}${pc.dim(cost)}${m.name ? pc.dim("  " + m.name) : ""}`;
+    });
+    console.log();
+    const mi = await select(rl, "Which model? (input/output cost per million tokens)", labels);
+    profile.model = options[mi]!.id;      // a concrete id, never an alias
   } else {
     const hint = activeRoute.id === "ollama" ? "qwen2.5-coder" : "";
     const ans = (await rl.question(
-      `Model id${hint ? ` [${hint}]` : ""} ${pc.dim("(ids differ on this route)")}: `,
+      `Model id${hint ? ` [${hint}]` : ""}: `,
     )).trim();
     profile.model = ans || hint || undefined;
   }
-
-  // Fetch prices once during setup: costs are frozen per task, so starting
-  // with current rates keeps day-one history accurate.
-  const { refreshPrices } = await import("./pricing.js");
-  process.stdout.write(pc.dim("  fetching current prices… "));
-  const n = await refreshPrices(undefined, { baseUrl: profile.baseUrl ?? activeRoute.baseUrl });
-  process.stdout.write("\r\x1b[2K");
-  if (!n) console.log(pc.dim("  (couldn't fetch prices — using built-in rates)"));
 
   const settings = loadSettings();
   settings.profiles[settings.activeProfile] = profile;

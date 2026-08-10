@@ -181,3 +181,85 @@ test("a route's own credential is never substituted with the generic one", async
     else process.env.ANTHROPIC_API_KEY = prevKey;
   }
 });
+
+test("switching route mid-session takes effect immediately, no restart", async () => {
+  const { Agent } = await import("../src/agent.js");
+  const fsx = await import("node:fs");
+  const osx = await import("node:os");
+  const pathx = await import("node:path");
+  const ws = fsx.mkdtempSync(pathx.join(osx.tmpdir(), "faber-switch-"));
+  const state = pathx.join(ws, ".faber");
+  fsx.mkdirSync(state, { recursive: true });
+
+  const base = {
+    workspace: ws, stateDir: state, maxTokens: 10, maxIterations: 1,
+    contextTokenBudget: 100, keepRecentMessages: 1, shellTimeoutMs: 1000,
+    maxFileReadBytes: 100, retryMaxAttempts: 1, approvalMode: "auto" as const,
+    memoryDb: pathx.join(state, "m.db"), indexDb: pathx.join(state, "i.db"),
+    sessionsDir: pathx.join(state, "s"), usageDb: pathx.join(state, "u.db"),
+    weakModel: undefined, region: undefined, modelPins: {}, profileName: "p",
+    priceIn: undefined, priceOut: undefined, autoRefreshPrices: false,
+  };
+  const anthropic = {
+    ...base, provider: "anthropic" as const, route: "anthropic-api",
+    model: "claude-sonnet-5", baseUrl: "https://api.anthropic.com", apiKey: "sk-ant-x",
+  };
+  const agent = new Agent(anthropic, async () => true, {});
+  assert.equal(agent.model, "claude-sonnet-5");
+  assert.equal(agent.config.route, "anthropic-api");
+
+  // what /setup does when the user picks OpenAI
+  agent.reconfigure({
+    ...base, provider: "openai" as const, route: "openai-api",
+    model: "gpt-4o", baseUrl: "https://api.openai.com/v1", apiKey: "sk-openai-x",
+  });
+  assert.equal(agent.model, "gpt-4o", "the session follows the new route");
+  assert.equal(agent.config.route, "openai-api");
+  assert.equal(agent.config.baseUrl, "https://api.openai.com/v1",
+    "and talks to the new endpoint, not the one it started with");
+  agent.close();
+});
+
+test("long menus filter as you type; short ones keep number shortcuts", async () => {
+  const { select } = await import("../src/prompt.js");
+  const { PassThrough } = await import("node:stream");
+
+  const drive = async (options: string[], keys: string): Promise<number> => {
+    const stdin = new PassThrough() as unknown as NodeJS.ReadStream;
+    (stdin as { isTTY?: boolean }).isTTY = true;
+    (stdin as unknown as { setRawMode: (b: boolean) => void }).setRawMode = () => {};
+    (stdin as unknown as { isRaw: boolean }).isRaw = false;
+    const realIn = process.stdin, realOut = process.stdout;
+    Object.defineProperty(process, "stdin", { value: stdin, configurable: true });
+    Object.defineProperty(process, "stdout", {
+      value: { isTTY: true, write: () => true }, configurable: true,
+    });
+    const realLog = console.log;
+    console.log = () => {};
+    try {
+      const rl = { pause() {}, resume() {} } as unknown as
+        import("node:readline/promises").Interface;
+      const p = select(rl, "pick", options);
+      await new Promise((r) => setImmediate(r));
+      (stdin as unknown as import("node:stream").PassThrough).write(keys);
+      return await p;
+    } finally {
+      console.log = realLog;
+      Object.defineProperty(process, "stdin", { value: realIn, configurable: true });
+      Object.defineProperty(process, "stdout", { value: realOut, configurable: true });
+    }
+  };
+
+  // A dozen models: typing narrows to the one you want instead of 11 arrow presses
+  const many = ["gpt-4o", "gpt-4o-mini", "o1", "o3-mini", "gpt-4-turbo", "gpt-4",
+                "gpt-3.5-turbo", "o1-pro", "gpt-5-codex", "gpt-4.1", "o4-mini", "gpt-4.5"];
+  assert.equal(many[await drive(many, "codex\r")], "gpt-5-codex",
+    "typing jumps straight to the match");
+  assert.equal(many[await drive(many, "o3\r")], "o3-mini");
+  // backspace edits the filter rather than cancelling
+  assert.equal(many[await drive(many, "codexx\x7f\r")], "gpt-5-codex");
+
+  // Short menus keep the 1-9 shortcuts, since there's nothing to search
+  const few = ["Anthropic", "OpenAI", "Local"];
+  assert.equal(few[await drive(few, "2")], "OpenAI");
+});

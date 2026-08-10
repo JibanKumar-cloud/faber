@@ -136,3 +136,57 @@ test("bedrock counts as complete when AWS credentials can sign, with no key", as
     if (prev.secret === undefined) delete process.env.AWS_SECRET_ACCESS_KEY; else process.env.AWS_SECRET_ACCESS_KEY = prev.secret;
   }
 });
+
+test("setup offers concrete model ids with prices, never bare aliases", async () => {
+  const { modelsForRoute, getRoute } = await import("../src/routes.js");
+  const { priceFor } = await import("../src/pricing.js");
+
+  // Whatever setup falls back to when discovery fails must still be a real,
+  // billable model id — an alias like "gpt" tells the user nothing about cost,
+  // and gpt-4o is ~17x the price of gpt-4o-mini.
+  for (const routeId of ["anthropic-api", "openai-api"]) {
+    const route = getRoute(routeId)!;
+    for (const m of modelsForRoute(route)) {
+      assert.match(m.id, /-/, `${m.id} should be a full model id, not an alias`);
+      const p = priceFor(m.id);
+      assert.ok(p, `no price known for ${m.id}, so setup couldn't show its cost`);
+      assert.ok(p!.in > 0 && p!.out > 0);
+    }
+  }
+
+  // and the price gap is exactly why the id matters
+  const big = priceFor("gpt-4o")!, small = priceFor("gpt-4o-mini")!;
+  assert.ok(big.in / small.in > 10, "these are not interchangeable choices");
+});
+
+test("a key the provider rejects fails setup; being offline does not", async () => {
+  const { LLMClient } = await import("../src/llm.js");
+  const http = await import("node:http");
+
+  // Servers are tracked and closed: an open listener keeps the test runner
+  // alive and the whole suite appears to hang.
+  const open: import("node:http").Server[] = [];
+  const serve = async (status: number): Promise<string> => {
+    const s = http.createServer((_q, r) => { r.writeHead(status); r.end("{}"); });
+    open.push(s);
+    return new Promise((res) =>
+      s.listen(0, "127.0.0.1", () => res(`http://127.0.0.1:${(s.address() as { port: number }).port}`)));
+  };
+  const cfg = (baseUrl: string) => ({
+    provider: "anthropic" as const, baseUrl, apiKey: "k", model: "x", route: "anthropic-api",
+  } as unknown as import("../src/config.js").Config);
+
+  // 401 and 403 are the provider saying the key is wrong: setup must not pass
+  assert.equal(await new LLMClient(cfg(await serve(401))).verifyKey(), "rejected");
+  assert.equal(await new LLMClient(cfg(await serve(403))).verifyKey(), "rejected");
+
+  // a working endpoint accepts it
+  assert.equal(await new LLMClient(cfg(await serve(200))).verifyKey(), "ok");
+
+  // anything else says nothing about the key, so setup carries on
+  assert.equal(await new LLMClient(cfg(await serve(500))).verifyKey(), "unreachable");
+  assert.equal(await new LLMClient(cfg("http://127.0.0.1:1")).verifyKey(), "unreachable",
+    "being offline must not block someone from finishing setup");
+
+  for (const s of open) s.close();
+});

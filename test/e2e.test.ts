@@ -175,10 +175,19 @@ test("e2e: CLI one-shot keeps the FIRST word of the task (regression: wsIdx=-1 b
   // async spawn (NOT execFileSync): the mock server runs in this process, so
   // a synchronous wait would block the event loop and deadlock the server.
   const out = await new Promise<string>((resolve, reject) => {
+    // Isolate the home directory. Since profiles landed, loadConfig reads
+    // ~/.faber/settings.json, so without this the spawned CLI inherits the
+    // developer's own route and model — and a machine configured for OpenAI
+    // would speak the wrong protocol to this Anthropic mock server.
+    const fakeHome = fs.mkdtempSync(path.join(os.tmpdir(), "faber-e2e-home-"));
     const child = spawn("node", [cli, "hello", "world"], {
       cwd: cfg.workspace,
       env: {
         ...process.env,
+        HOME: fakeHome,
+        USERPROFILE: fakeHome,          // os.homedir() reads this on Windows
+        FABER_ROUTE: "anthropic-api",   // never inherit a configured route
+        FABER_AUTO_PRICES: "0",         // no network during tests
         ANTHROPIC_API_KEY: "test-key",
         CW_BASE_URL: srv.url,
         CW_APPROVAL: "auto",

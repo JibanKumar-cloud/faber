@@ -15,7 +15,32 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { modelsForRoute, type ModelChoice, type Route } from "./routes.js";
 
-export interface DiscoveredModel { id: string; name?: string; }
+export interface DiscoveredModel { id: string; name?: string; created?: number; }
+
+/**
+ * Order the model list the way someone choosing one would want it.
+ *
+ * On OpenAI the coding-tuned models matter most to a coding agent, so those
+ * come first as a group; everything else follows. Within each group, newest
+ * first, since a release date is the only ranking the provider actually gives
+ * us. Anthropic has no such split, so it's purely newest first.
+ */
+export function isCodexModel(id: string): boolean {
+  return /codex/i.test(id);
+}
+
+export function sortModels(models: DiscoveredModel[], wire: "anthropic" | "openai"): DiscoveredModel[] {
+  const byDate = (a: DiscoveredModel, b: DiscoveredModel): number => {
+    if (a.created && b.created) return b.created - a.created;
+    if (a.created) return -1;      // dated entries above undated ones
+    if (b.created) return 1;
+    return a.id.localeCompare(b.id);
+  };
+  if (wire !== "openai") return [...models].sort(byDate);
+  const codex = models.filter((m) => isCodexModel(m.id)).sort(byDate);
+  const rest = models.filter((m) => !isCodexModel(m.id)).sort(byDate);
+  return [...codex, ...rest];
+}
 
 const TTL_MS = 24 * 60 * 60 * 1000;   // a day: new models are rare, staleness is cheap
 
@@ -46,6 +71,24 @@ export function clearCache(routeId: string): void {
   try { fs.unlinkSync(cacheFile(routeId)); } catch { /* already gone */ }
 }
 
+/**
+ * Can this model actually run an agent loop?
+ *
+ * Provider catalogues list everything the key can call: embeddings, speech,
+ * transcription, moderation, image generation. None of them accept a chat
+ * request, so offering them as a choice is offering a guaranteed failure.
+ * Excluding by capability keyword is deliberately conservative — anything
+ * unrecognised is kept, since a new chat model must never be filtered out.
+ */
+const NOT_CHAT = /(^|[-_/])(embedding|embed|tts|whisper|moderation|dall-e|dalle|image|audio|transcribe|realtime|speech|rerank|search-preview|codex-mini-latest)([-_/]|$)/i;
+
+/** Retired completion-only families that predate the chat API. */
+const LEGACY = /^(davinci|babbage|curie|ada|text-davinci|code-davinci)/i;
+
+export function isChatModel(id: string): boolean {
+  return !NOT_CHAT.test(id) && !LEGACY.test(id);
+}
+
 export interface PickerEntry {
   value: string;      // what gets passed to resolveModel()
   label: string;      // left column
@@ -71,8 +114,9 @@ export function buildPicker(
     live: false,
   }));
   const covered = new Set(aliases.map((a) => a.id));
-  for (const m of discovered) {
+  for (const m of sortModels(discovered, route.wire)) {
     if (covered.has(m.id)) continue;
+    if (!isChatModel(m.id)) continue;   // embeddings, speech, moderation…
     entries.push({ value: m.id, label: m.id, blurb: m.name ?? "", live: true });
   }
   // if the model in use is neither an alias nor discovered, keep it visible

@@ -73,7 +73,7 @@ export class Agent {
    *  next loop boundary so the model course-corrects without cancelling. */
   private steerQueue: string[] = [];
   private steerNonce = "";
-  readonly llm: LLMClient;
+  llm: LLMClient;
   readonly usage: UsageLedger;
   readonly checkpoints: CheckpointManager;
   readonly longTerm: LongTermMemory;
@@ -83,7 +83,7 @@ export class Agent {
   readonly session: SessionStore;
 
   constructor(
-    readonly config: Config,
+    public config: Config,
     approve: ApprovalFn,
     private events: AgentEvents = {},
     resumeSessionId?: string,
@@ -109,6 +109,18 @@ export class Agent {
   setModel(id: string): void {
     this.model = id;
     this.llm.setModel(id);
+  }
+
+  /**
+   * Adopt a new configuration in the running session, after /setup or /route
+   * changed the route. Without this the session keeps talking to the old
+   * provider while the settings file says otherwise, so /model would list
+   * models for a route the user thought they had left.
+   */
+  reconfigure(next: Config): void {
+    this.config = next;
+    this.model = next.model;
+    this.llm = new LLMClient(next);
   }
 
   steer(text: string): void {

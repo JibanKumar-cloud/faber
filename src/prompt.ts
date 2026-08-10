@@ -35,18 +35,51 @@ async function selectRaw(
     return Number.isInteger(n) && n >= 1 && n <= options.length ? n - 1 : defaultIndex;
   }
 
-  console.log(pc.bold(question) + pc.dim("   ↑/↓ then Enter, or 1-9"));
+  // Long lists (a provider can return dozens of models) are unusable with
+  // arrow keys alone, so typing filters the list as you go.
+  const searchable = options.length > 8;
+  console.log(pc.bold(question) +
+    pc.dim(searchable ? "   ↑/↓ then Enter · type to filter" : "   ↑/↓ then Enter, or 1-9"));
+
   return new Promise<number>((resolve) => {
-    let idx = defaultIndex;
-    let firstRender = true;
+    let filter = "";
+    let view = options.map((_, i) => i);          // indices currently shown
+    let cursor = Math.max(0, view.indexOf(defaultIndex));
+    let painted = 0;                              // rows drawn last time
+
+    const applyFilter = (): void => {
+      const q = filter.toLowerCase();
+      const next = options
+        .map((o, i) => [o, i] as const)
+        .filter(([o]) => o.toLowerCase().includes(q))
+        .map(([, i]) => i);
+      view = next.length ? next : [];
+      cursor = 0;
+    };
+
     const render = (): void => {
-      if (!firstRender) process.stdout.write(`\x1b[${options.length}A`);
-      firstRender = false;
-      for (let i = 0; i < options.length; i++) {
+      if (painted) process.stdout.write(`\x1b[${painted}A`);
+      const rows = view.length ? view.length : 1;
+      const extra = filter ? 1 : 0;
+      for (let r = 0; r < view.length; r++) {
         process.stdout.write("\x1b[2K");
+        const i = view[r]!;
         process.stdout.write(
-          (i === idx ? pc.cyan(`❯ ${options[i]}`) : pc.dim(`  ${options[i]}`)) + "\n",
+          (r === cursor ? pc.cyan(`❯ ${options[i]}`) : pc.dim(`  ${options[i]}`)) + "\n",
         );
+      }
+      if (!view.length) {
+        process.stdout.write("\x1b[2K" + pc.yellow(`  no match for "${filter}"`) + "\n");
+      }
+      if (filter) {
+        process.stdout.write("\x1b[2K" + pc.dim(`  filter: ${filter}`) + "\n");
+      }
+      // clear any rows the previous, longer render left behind
+      for (let r = rows + extra; r < painted; r++) process.stdout.write("\x1b[2K\n");
+      painted = Math.max(rows + extra, painted);
+      if (painted > rows + extra) {
+        process.stdout.write(`\x1b[${painted - (rows + extra)}A`);
+        painted = rows + extra;
       }
     };
 
@@ -74,10 +107,26 @@ async function selectRaw(
         let key: string;
         if (s[i] === "\x1b" && s[i + 1] === "[") { key = s.slice(i, i + 3); i += 3; }
         else { key = s[i]!; i += 1; }
-        if (key === "\x1b[A" || key === "k") { idx = (idx - 1 + options.length) % options.length; render(); }
-        else if (key === "\x1b[B" || key === "j") { idx = (idx + 1) % options.length; render(); }
-        else if (key >= "1" && key <= "9" && Number(key) <= options.length) { idx = Number(key) - 1; render(); finish(idx); done = true; }
-        else if (key === "\r" || key === "\n") { finish(idx); done = true; }
+        if (key === "\x1b[A") { if (view.length) cursor = (cursor - 1 + view.length) % view.length; render(); }
+        else if (key === "\x1b[B") { if (view.length) cursor = (cursor + 1) % view.length; render(); }
+        else if (key === "\r" || key === "\n") {
+          if (view.length) { finish(view[cursor]!); done = true; }
+        }
+        else if (key === "\x7f" || key === "\b") {          // backspace edits the filter
+          if (filter) { filter = filter.slice(0, -1); applyFilter(); render(); }
+        }
+        // Number shortcuts only while unfiltered; once you're typing, digits
+        // are part of the search term (model ids are full of them).
+        else if (!filter && !searchable && key >= "1" && key <= "9" && Number(key) <= options.length) {
+          finish(Number(key) - 1); done = true;
+        }
+        else if (searchable && key >= " " && key !== "\x1b") {
+          filter += key; applyFilter(); render();
+        }
+        else if (!searchable && (key === "k" || key === "j")) {
+          if (view.length) cursor = (cursor + (key === "k" ? -1 : 1) + view.length) % view.length;
+          render();
+        }
         // Ctrl-C or Esc cancels. Returning -1 used to leak out as an array
         // index, crashing the caller with "cannot read properties of
         // undefined" — a cancel must be a clean exit, not a bad index.

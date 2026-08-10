@@ -352,9 +352,15 @@ async function main(): Promise<void> {
           console.log(`No model list available for ${route.label}. Set one with: /model <id>`);
           break;
         }
+        // Show the rate here too. /model is where people switch models to save
+        // money, so hiding the price is exactly backwards.
         const width = Math.min(34, Math.max(...entries.map((e) => e.label.length)) + 2);
-        const labels = entries.map((e) =>
-          `${e.label.padEnd(width)}${pc.dim(e.blurb)}${e.live ? pc.dim("  ·live") : ""}`);
+        const labels = entries.map((e) => {
+          const id = resolveModel(e.value, route, config.modelPins);
+          const p = priceFor(id, { in: config.priceIn, out: config.priceOut });
+          const cost = p ? `$${p.in}/$${p.out} per Mtok` : "price unknown";
+          return `${e.label.padEnd(width)}${pc.dim(cost.padEnd(22))}${pc.dim(e.blurb)}`;
+        });
         const curIdx = entries.findIndex(
           (e) => e.value === agent.model || resolveModel(e.value, route, config.modelPins) === agent.model);
         const pick = await select(rl, "Select model (this session)", labels, curIdx < 0 ? 0 : curIdx);
@@ -397,7 +403,14 @@ async function main(): Promise<void> {
       case "/setup": {
         const setup = await runOnboarding(rl);
         reportSetup(setup);
-        console.log(pc.dim("  restart faber to apply"));
+        if (!setup.aborted) {
+          // Apply in this session. Telling the user to restart left the
+          // running agent on the old route, so /model would then list models
+          // for the provider they had just switched away from.
+          config = loadConfig(config.workspace);
+          agent.reconfigure(config);
+          console.log(pc.dim(`  now using ${describeModel(config.model, getRoute(config.route) ?? ROUTES[0]!, config.modelPins)} on ${getRoute(config.route)?.label}`));
+        }
         break;
       }
       case "/route": {
@@ -438,7 +451,9 @@ async function main(): Promise<void> {
         if (chosen.aliasesArePinned) {
           console.log(pc.dim("  model ids differ on this route — set one with: /model <id>"));
         }
-        console.log(pc.dim("  restart faber to apply"));
+        config = loadConfig(config.workspace);
+        agent.reconfigure(config);
+        console.log(pc.dim(`  now on ${getRoute(config.route)?.label}`));
         break;
       }
       case "/profile": {
@@ -456,7 +471,9 @@ async function main(): Promise<void> {
         if (!st.profiles[args[0]]) { console.log(`No profile "${args[0]}".`); break; }
         st.activeProfile = args[0];
         saveSettings(st);
-        console.log(`Active profile: ${args[0]}. Restart faber to apply.`);
+        config = loadConfig(config.workspace);
+        agent.reconfigure(config);
+        console.log(`Active profile: ${args[0]} — ${getRoute(config.route)?.label}, ${config.model}.`);
         break;
       }
       case "/usage": {

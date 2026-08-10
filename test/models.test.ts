@@ -67,7 +67,7 @@ test("discovery: OpenAI-compatible shape (Bedrock mantle, Ollama) uses /models +
   const llm = new LLMClient({ ...baseCfg, provider: "openai", baseUrl: srv.url, route: "ollama" });
   const models = await llm.listModels();
   srv.close();
-  assert.deepEqual(models, [{ id: "qwen2.5-coder", name: undefined }]);
+  assert.deepEqual(models, [{ id: "qwen2.5-coder", name: undefined, created: undefined }]);
   assert.equal(seenPath, "/models");
   assert.equal(seenAuth, "Bearer k");
 });
@@ -225,4 +225,91 @@ test("pricing: OpenRouter publishes live prices and they win for that route", as
     { in: 2, out: 10, cacheRead: 0.2, cacheWrite: 2.5 });
   assert.deepEqual(live["free/model"], { in: 0, out: 0 }, "free models price at zero, not undefined");
   assert.ok(!("broken/model" in live), "unparseable entries are dropped");
+});
+
+test("model picker keeps chat models and drops ones that can't chat", async () => {
+  const { isChatModel, buildPicker } = await import("../src/models.js");
+  const { getRoute } = await import("../src/routes.js");
+
+  // these accept chat requests
+  for (const id of ["gpt-4o", "gpt-4o-mini", "o1", "o3-mini", "gpt-5.3-codex",
+                    "claude-sonnet-5", "claude-opus-4-8", "qwen2.5-coder"]) {
+    assert.equal(isChatModel(id), true, `${id} should be offered`);
+  }
+  // these do not — offering them is offering a guaranteed failure
+  for (const id of ["text-embedding-ada-002", "text-embedding-3-large", "whisper-1",
+                    "tts-1-hd", "omni-moderation-latest", "dall-e-3", "davinci-002",
+                    "babbage-002", "gpt-4o-transcribe"]) {
+    assert.equal(isChatModel(id), false, `${id} should be filtered out`);
+  }
+
+  // and the picker applies it, so a real catalogue doesn't drown the user
+  const entries = buildPicker(getRoute("openai-api")!, [
+    { id: "gpt-4o" }, { id: "text-embedding-3-small" }, { id: "whisper-1" }, { id: "o3-mini" },
+  ], "gpt-4o");
+  const live = entries.filter((e) => e.live).map((e) => e.value);
+  assert.deepEqual(live, ["o3-mini"], "only chat models are appended (gpt-4o is already an alias)");
+});
+
+test("unsupported-endpoint and deprecation errors say what to do next", async () => {
+  const { LLMClient } = await import("../src/llm.js");
+  const http = await import("node:http");
+  const open: import("node:http").Server[] = [];
+  const serve = async (body: string): Promise<string> => {
+    const s = http.createServer((_q, r) => { r.writeHead(404); r.end(body); });
+    open.push(s);
+    return new Promise((res) => s.listen(0, "127.0.0.1", () =>
+      res(`http://127.0.0.1:${(s.address() as { port: number }).port}`)));
+  };
+  const cfg = (baseUrl: string) => ({
+    ...baseCfg, provider: "openai" as const, baseUrl, model: "gpt-5.3-codex",
+  });
+
+  const responsesOnly = await serve(JSON.stringify({
+    error: { message: "This model is not supported in the v1/chat/completions endpoint. Use the v1/responses endpoint instead." },
+  }));
+  await assert.rejects(
+    new LLMClient(cfg(responsesOnly)).complete("s", [], [], () => {}),
+    (e: Error) => /Responses API/.test(e.message) && /\/model/.test(e.message),
+  );
+
+  const deprecated = await serve(JSON.stringify({
+    error: { message: "The model `gpt-5.1-codex-mini` has been deprecated" },
+  }));
+  await assert.rejects(
+    new LLMClient(cfg(deprecated)).complete("s", [], [], () => {}),
+    (e: Error) => /deprecated/.test(e.message) && /\/model/.test(e.message),
+  );
+
+  for (const s of open) s.close();
+});
+
+test("OpenAI lists codex models first, then the rest, newest within each", async () => {
+  const { sortModels } = await import("../src/models.js");
+  const d = (s: string): number => Math.floor(Date.parse(s) / 1000);
+  const models = [
+    { id: "gpt-5.2", created: d("2025-12-11") },
+    { id: "gpt-5.5", created: d("2026-04-23") },
+    { id: "gpt-5.2-codex", created: d("2025-12-11") },
+    { id: "gpt-5.3-codex", created: d("2026-01-20") },
+    { id: "gpt-5.4-mini", created: d("2026-03-17") },
+  ];
+  assert.deepEqual(sortModels(models, "openai").map((m) => m.id), [
+    "gpt-5.3-codex", "gpt-5.2-codex",       // coding models lead, newest first
+    "gpt-5.5", "gpt-5.4-mini", "gpt-5.2",   // then the rest, newest first
+  ]);
+
+  // Anthropic has no coding split, so it's purely newest first
+  const claude = [
+    { id: "claude-sonnet-4-5", created: d("2025-09-29") },
+    { id: "claude-opus-5", created: d("2026-05-01") },
+    { id: "claude-fable-5", created: d("2026-06-09") },
+  ];
+  assert.deepEqual(sortModels(claude, "anthropic").map((m) => m.id), [
+    "claude-fable-5", "claude-opus-5", "claude-sonnet-4-5",
+  ]);
+
+  // entries with no date fall below dated ones rather than jumping the queue
+  const mixed = [{ id: "zzz-undated" }, { id: "gpt-5.5", created: d("2026-04-23") }];
+  assert.deepEqual(sortModels(mixed, "openai").map((m) => m.id), ["gpt-5.5", "zzz-undated"]);
 });

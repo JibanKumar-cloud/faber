@@ -95,6 +95,7 @@ export function listCredentialNames(file = credentialsPath()): string[] {
  * accepting an odd one. This only catches obvious mistakes: a typo, a pasted
  * filename, an accidental keystroke. Returns a reason when it looks wrong.
  */
+
 export function looksLikeKey(envName: string, value: string): string | undefined {
   const v = value.trim();
   if (v.length < 20) return "that looks too short for an API key";

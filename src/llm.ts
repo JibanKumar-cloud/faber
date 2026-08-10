@@ -64,7 +64,32 @@ export class LLMClient {
    * minus display_name. Returns [] on any failure — this is a convenience,
    * never a blocker, so an offline or restricted key just falls back.
    */
-  async listModels(signal?: AbortSignal): Promise<{ id: string; name?: string }[]> {
+  /**
+   * Check whether the provider accepts this credential.
+   * "rejected" means the key is definitively wrong (401/403) — that is a
+   * failed setup. "unreachable" covers being offline or an endpoint without a
+   * models route, which says nothing about the key and must not block setup.
+   */
+  async verifyKey(): Promise<"ok" | "rejected" | "unreachable"> {
+    const anthropic = this.config.provider === "anthropic";
+    const url = anthropic ? `${this.config.baseUrl}/v1/models?limit=1`
+                          : `${this.config.baseUrl}/models`;
+    const headers: Record<string, string> = anthropic
+      ? { "x-api-key": this.config.apiKey!, "anthropic-version": "2023-06-01" }
+      : { authorization: `Bearer ${this.config.apiKey}` };
+    try {
+      const ctl = new AbortController();
+      const timer = setTimeout(() => ctl.abort(), 8000);
+      const res = await fetch(url, { headers, signal: ctl.signal });
+      clearTimeout(timer);
+      if (res.status === 401 || res.status === 403) return "rejected";
+      return res.ok ? "ok" : "unreachable";
+    } catch {
+      return "unreachable";
+    }
+  }
+
+  async listModels(signal?: AbortSignal): Promise<{ id: string; name?: string; created?: number }[]> {
     const anthropic = this.config.provider === "anthropic";
     const url = anthropic
       ? `${this.config.baseUrl}/v1/models?limit=100`
@@ -79,10 +104,21 @@ export class LLMClient {
       const res = await fetch(url, { headers, signal: ctl.signal });
       clearTimeout(timer);
       if (!res.ok) return [];
-      const body = await res.json() as { data?: { id?: string; display_name?: string }[] };
+      const body = await res.json() as {
+        data?: { id?: string; display_name?: string; created?: number; created_at?: string }[];
+      };
       return (body.data ?? [])
-        .filter((m): m is { id: string; display_name?: string } => typeof m.id === "string")
-        .map((m) => ({ id: m.id, name: m.display_name }));
+        .filter((m): m is { id: string; display_name?: string; created?: number; created_at?: string } =>
+          typeof m.id === "string")
+        .map((m) => ({
+          id: m.id,
+          name: m.display_name,
+          // OpenAI sends a unix timestamp; Anthropic an ISO date. Either way
+          // this is the release date the picker sorts on.
+          created: typeof m.created === "number" ? m.created
+            : m.created_at ? Math.floor(Date.parse(m.created_at) / 1000) || undefined
+            : undefined,
+        }));
     } catch {
       return [];   // offline, no permission, or an endpoint without the route
     }
@@ -316,7 +352,24 @@ export class LLMClient {
     if (res.status === 401 || res.status === 403) {
       throw new FatalError(`Authentication failed (HTTP ${res.status}). Check your API key.`);
     }
-    if (!res.ok) throw new FatalError(`API error HTTP ${res.status}: ${(await res.text()).slice(0, 500)}`);
+    if (!res.ok) {
+      const body = (await res.text()).slice(0, 500);
+      // Some newer OpenAI models are only served by the Responses API, which
+      // Faber doesn't speak yet. The raw 404 doesn't say what to do about it.
+      if (/v1\/responses endpoint/i.test(body)) {
+        throw new FatalError(
+          `${this.config.model} needs OpenAI's Responses API, which Faber doesn't support yet.\n` +
+          `  Pick a model that works with chat completions — /model, then try gpt-5.4 or gpt-5.5.`,
+        );
+      }
+      if (/has been deprecated/i.test(body)) {
+        throw new FatalError(
+          `${this.config.model} has been deprecated by the provider.\n` +
+          `  Choose another with /model — the catalogue still lists retired models.`,
+        );
+      }
+      throw new FatalError(`API error HTTP ${res.status}: ${body}`);
+    }
     return res;
   }
 }
