@@ -1,28 +1,15 @@
 # Faber
 
-**An agentic AI coding assistant for your terminal.** Give it a task in plain English; it explores your repository, edits files with your approval, runs your tests, and remembers your project across sessions.
+**A cost and performance efficient agentic AI coding assistant for your terminal.** Give it a task in plain English; it explores your repository, edits files with your approval, runs your tests, and remembers your project across sessions.
 
 *Faber — Latin for craftsman. Yours lives at `faber`.*
+* Read: [Faber Medium](https://medium.com/@jshial25/why-should-an-ai-coding-agent-read-hundreds-of-files-to-answer-one-question-d6369d29dfa5?postPublishedType=repub)
+## Code Graph
+<img width="636" height="573" alt="Screenshot 2026-08-09 at 2 58 30 PM" src="https://github.com/user-attachments/assets/176e5093-8e29-452f-a749-d06a561c583a" />
 
-```
-$ faber "add input validation to the signup endpoint and cover it with tests"
-  ⚙ trace_path (from=main, to=handleSignup)
-  ⚙ read_file (path=app/routes/auth.ts)
+## Demo 
+<img width="1240" height="700" alt="terminal_demo_compressed" src="https://github.com/user-attachments/assets/f78a8f68-130e-4f37-90f2-7a7089fa2653" />
 
-Proposed change to app/routes/auth.ts:
-@@ -12,6 +12,9 @@
-+  if (!isEmail(req.body.email)) return res.status(400)...
-Apply?   ↑/↓ then Enter
-❯ Yes
-  No
-  Always this session
-
-  ⚙ run_shell (command=npm test)
-─ result ────────────────────────────
-Added email/password validation to /signup, verified with 4 new passing tests.
-─────────────────────────────────────
-tokens: 31.2k in (78% cached) / 1.9k out · 7 calls
-```
 
 ## Your first session (2 minutes)
 
@@ -190,6 +177,10 @@ model        gpt-5.3-codex     which model ran it
 cost         0.0412            dollars, frozen at run time
 saved        0.0231            what caching avoided
 ```
+**Cost metrics `/usage`:
+
+<img width="636" height="388" alt="Screenshot 2026-08-10 at 12 25 57 AM" src="https://github.com/user-attachments/assets/33ba06ce-69ad-4afe-afcc-6119a897e67a" />
+
 
 Counters and a timestamp. No prompts, no code, no file contents. Around 80 bytes a row, so a year of heavy use is roughly a megabyte, and nothing is ever pruned.
 
