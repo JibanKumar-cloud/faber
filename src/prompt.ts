@@ -94,6 +94,11 @@ async function selectRaw(
       stdin.removeListener("data", onData);
       stdin.setRawMode(wasRaw);
       guardFn?.(false);
+      // Drop anything still buffered — typically the Enter that confirmed this
+      // menu. Left in place, readline hands it straight to the next question,
+      // which then returns an empty answer before the user can type a
+      // character: the prompt appears and vanishes in the same instant.
+      try { while (stdin.read() !== null) { /* discard */ } } catch { /* not readable */ }
       rl.resume();
       resolve(result);
     };

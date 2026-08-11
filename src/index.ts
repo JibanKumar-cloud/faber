@@ -40,6 +40,7 @@ import { Composer } from "./editor.js";
 import { StatusLine } from "./status.js";
 import { renderMarkdown, StreamRenderer } from "./markdown.js";
 import { renderUsagePanel, UsageLedger } from "./usage.js";
+import { looksLikeCommand } from "./commands.js";
 import { ROUTES, getRoute, modelsForRoute, describeModel, resolveModel, vendors, baseUrlFor, DEFAULT_REGION } from "./routes.js";
 import { loadSettings, saveSettings, updateActive, activeProfile, settingsPath } from "./settings.js";
 import { needsOnboarding, interactive, runOnboarding, reportSetup, setupComplete, ensureCredential } from "./onboard.js";
@@ -67,6 +68,20 @@ function renderDiff(diff: string): string {
     : pc.dim(l),
   ).join("\n");
 }
+
+/**
+ * Is this line a command, or a question that happens to mention one?
+ *
+ * Matching on the first word alone meant "/undo and /redo how does it work?"
+ * ran /undo and reverted the user's files. A destructive command must be the
+ * whole line — anything trailing means the person is talking, not commanding.
+ */
+const NO_ARG_COMMANDS = new Set([
+  "/undo", "/redo", "/history", "/clear", "/compact", "/sessions", "/help",
+  "/exit", "/quit", "/index", "/memory", "/ask", "/auto", "/verbose",
+  "/concise", "/setup", "/route",
+]);
+
 
 async function main(): Promise<void> {
   const argv = process.argv.slice(2);
@@ -549,7 +564,7 @@ async function main(): Promise<void> {
         catch { break; }
       }
       if (!line) continue;
-      if (line.startsWith("/")) {
+      if (line.startsWith("/") && looksLikeCommand(line)) {
         if (!(await command(line))) break;
         continue;
       }
@@ -563,6 +578,13 @@ async function main(): Promise<void> {
 }
 
 const HELP = `
+  /setup              set up again: vendor, route, credential, model
+  /route              choose a vendor and how to reach it
+  /model [id]         switch model; lists what your key can use, with prices
+  /key [set|rm]       show, save or remove an API key (~/.faber, readable only by you)
+  /profile [name]     list or switch saved profiles
+  /usage              cost ledger by time window and model (--refresh-prices)
+  /verbose | /concise full-depth answers, or short ones (default concise)
   /index              rebuild the code graph (symbols + call edges)
   /map <symbol>       print the call tree from any entry point (e.g. /map main)
   /memory             show active long-term memories (+ file notes)

@@ -126,7 +126,7 @@ export async function discoverAwsCredentials(
       accessKeyId: process.env.AWS_ACCESS_KEY_ID,
       secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
       sessionToken: process.env.AWS_SESSION_TOKEN,
-      source: "environment",
+      source: "your environment",
     };
   }
   // 2. container credential endpoint (ECS, SageMaker, CodeBuild)
@@ -159,7 +159,7 @@ async function fetchContainerCredentials(url: string): Promise<AwsCredentials | 
       accessKeyId: b.AccessKeyId,
       secretAccessKey: b.SecretAccessKey,
       sessionToken: b.Token,
-      source: "container credentials endpoint",
+      source: "this environment's role",
     };
   } catch {
     return undefined;
@@ -194,4 +194,44 @@ export function readSharedCredentials(
     sessionToken: section["aws_session_token"],
     source: `~/.aws/credentials [${wanted}]`,
   };
+}
+
+/**
+ * Find the AWS region the way the SDKs do.
+ *
+ * Credentials don't carry a region, but the endpoint and the signature both
+ * need one — so it has to come from somewhere. In SageMaker, Lambda and ECS
+ * it's already in the environment, and on a laptop it's usually in the config
+ * file, which means asking is normally an unnecessary question.
+ */
+export function discoverAwsRegion(
+  profileName = process.env.AWS_PROFILE ?? "default",
+  file = path.join(os.homedir(), ".aws", "config"),
+): { region: string; source: string } | undefined {
+  const env = process.env.AWS_REGION ?? process.env.AWS_DEFAULT_REGION;
+  if (env) {
+    return {
+      region: env,
+      source: process.env.AWS_REGION ? "AWS_REGION" : "AWS_DEFAULT_REGION",
+    };
+  }
+  // ~/.aws/config uses "[profile name]" for everything except default
+  let text: string;
+  try { text = fs.readFileSync(file, "utf8"); } catch { return undefined; }
+  const wanted = profileName === "default" ? "default" : `profile ${profileName}`;
+  let current = "";
+  for (const raw of text.split("\n")) {
+    const line = raw.split(/[#;]/)[0]!.trim();
+    if (!line) continue;
+    const header = /^\[(.+)\]$/.exec(line);
+    if (header) { current = header[1]!.trim(); continue; }
+    if (current !== wanted) continue;
+    const eq = line.indexOf("=");
+    if (eq === -1) continue;
+    if (line.slice(0, eq).trim().toLowerCase() === "region") {
+      const region = line.slice(eq + 1).trim();
+      if (region) return { region, source: `~/.aws/config [${profileName}]` };
+    }
+  }
+  return undefined;
 }

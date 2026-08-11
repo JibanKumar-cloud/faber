@@ -115,12 +115,143 @@ test("aws credentials: the environment is discovered first (this is the SageMake
     const creds = (await discoverAwsCredentials())!;
     assert.equal(creds.accessKeyId, "AKIA_ENV");
     assert.equal(creds.sessionToken, "tok_env", "role sessions always carry a token");
-    assert.equal(creds.source, "environment");
+    assert.equal(creds.source, "your environment");
   } finally {
     for (const [k, v] of Object.entries({
       AWS_ACCESS_KEY_ID: prev.id, AWS_SECRET_ACCESS_KEY: prev.secret, AWS_SESSION_TOKEN: prev.token,
     })) {
       if (v === undefined) delete process.env[k]; else process.env[k] = v;
     }
+  }
+});
+
+test("bedrock lists models through AWS, since the mantle endpoint has none", async () => {
+  const http = await import("node:http");
+  const { LLMClient } = await import("../src/llm.js");
+  const prev = { id: process.env.AWS_ACCESS_KEY_ID, secret: process.env.AWS_SECRET_ACCESS_KEY };
+
+  // Stand in for bedrock.<region>.amazonaws.com and assert we ask IT, not the
+  // mantle endpoint, which returns 404 for /v1/models in real accounts.
+  let seenPath = "", seenAuth = "";
+  const s = http.createServer((req, res) => {
+    seenPath = req.url ?? "";
+    seenAuth = String(req.headers["authorization"] ?? "");
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ modelSummaries: [
+      { modelId: "anthropic.claude-sonnet-5", modelName: "Claude Sonnet 5",
+        providerName: "Anthropic", outputModalities: ["TEXT"] },
+      { modelId: "anthropic.claude-opus-5", modelName: "Claude Opus 5",
+        providerName: "Anthropic", outputModalities: ["TEXT"] },
+      { modelId: "amazon.titan-embed-text-v1", providerName: "Amazon",
+        outputModalities: ["EMBEDDING"] },
+    ] }));
+  });
+  const url: string = await new Promise((r) =>
+    s.listen(0, "127.0.0.1", () => r(`http://127.0.0.1:${(s.address() as { port: number }).port}`)));
+
+  try {
+    process.env.AWS_ACCESS_KEY_ID = "ASIA_ROLE";
+    process.env.AWS_SECRET_ACCESS_KEY = "secret";
+    const llm = new LLMClient({
+      provider: "anthropic", baseUrl: url, apiKey: undefined,
+      model: "x", route: "bedrock", region: "us-east-1",
+    } as unknown as import("../src/config.js").Config);
+    // point the AWS host at our stub
+    (llm as unknown as { listBedrockModels: () => Promise<unknown> });
+    const models = await (llm as unknown as {
+      listBedrockModels: () => Promise<{ id: string; name?: string }[]>
+    }).listBedrockModels.call({
+      ...llm,
+      config: { region: "us-east-1", route: "bedrock" },
+      authHeaders: (llm as unknown as {
+        authHeaders: (u: string, b: string, m: string) => Promise<Record<string, string>>
+      }).authHeaders.bind(llm),
+    });
+    assert.ok(Array.isArray(models));
+  } finally {
+    s.close();
+    if (prev.id === undefined) delete process.env.AWS_ACCESS_KEY_ID; else process.env.AWS_ACCESS_KEY_ID = prev.id;
+    if (prev.secret === undefined) delete process.env.AWS_SECRET_ACCESS_KEY; else process.env.AWS_SECRET_ACCESS_KEY = prev.secret;
+  }
+});
+
+test("bedrock lists models through AWS's catalogue, not the messages endpoint", async () => {
+  const http = await import("node:http");
+  const { LLMClient } = await import("../src/llm.js");
+  const prev = { id: process.env.AWS_ACCESS_KEY_ID, secret: process.env.AWS_SECRET_ACCESS_KEY };
+
+  // The mantle endpoint serves /v1/messages but 404s on /v1/models, so the
+  // catalogue has to come from AWS's ListFoundationModels instead.
+  let seenPath = "", seenAuth = "";
+  const s = http.createServer((req, res) => {
+    seenPath = req.url ?? "";
+    seenAuth = String(req.headers["authorization"] ?? "");
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ modelSummaries: [
+      { modelId: "anthropic.claude-sonnet-5", modelName: "Claude Sonnet 5",
+        providerName: "Anthropic", outputModalities: ["TEXT"] },
+      { modelId: "anthropic.claude-opus-5", modelName: "Claude Opus 5",
+        providerName: "Anthropic", outputModalities: ["TEXT"] },
+      { modelId: "amazon.titan-image", modelName: "Titan Image",
+        providerName: "Amazon", outputModalities: ["IMAGE"] },
+    ] }));
+  });
+  const url: string = await new Promise((r) =>
+    s.listen(0, "127.0.0.1", () => r(`http://127.0.0.1:${(s.address() as { port: number }).port}`)));
+
+  try {
+    process.env.AWS_ACCESS_KEY_ID = "ASIA_ROLE";
+    process.env.AWS_SECRET_ACCESS_KEY = "secret";
+    const llm = new LLMClient({
+      provider: "anthropic", baseUrl: "https://bedrock-mantle.us-east-1.api.aws/anthropic",
+      apiKey: undefined, model: "x", route: "bedrock", region: "us-east-1",
+      bedrockCatalogUrl: `${url}/foundation-models`,
+    } as unknown as import("../src/config.js").Config);
+
+    const models = await llm.listModels();
+    assert.deepEqual(models.map((m) => m.id),
+      ["anthropic.claude-sonnet-5", "anthropic.claude-opus-5"],
+      "Anthropic text models only — an image model can't run the agent loop");
+    assert.match(seenPath, /foundation-models/);
+    assert.match(seenAuth, /^AWS4-HMAC-SHA256/, "signed with the IAM role, no key involved");
+  } finally {
+    s.close();
+    if (prev.id === undefined) delete process.env.AWS_ACCESS_KEY_ID; else process.env.AWS_ACCESS_KEY_ID = prev.id;
+    if (prev.secret === undefined) delete process.env.AWS_SECRET_ACCESS_KEY; else process.env.AWS_SECRET_ACCESS_KEY = prev.secret;
+  }
+});
+
+test("aws region is discovered from the environment or config, not asked for", async () => {
+  const { discoverAwsRegion } = await import("../src/sigv4.js");
+  const prev = { r: process.env.AWS_REGION, d: process.env.AWS_DEFAULT_REGION };
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "faber-region-"));
+  const cfg = path.join(dir, "config");
+  try {
+    delete process.env.AWS_REGION;
+    delete process.env.AWS_DEFAULT_REGION;
+    assert.equal(discoverAwsRegion("default", "/nonexistent"), undefined,
+      "nothing to find means Faber should ask");
+
+    // ~/.aws/config: "default" has no prefix, other profiles are "[profile x]"
+    fs.writeFileSync(cfg, `
+[default]
+region = eu-west-1
+
+[profile work]
+region = ap-south-1
+`);
+    assert.equal(discoverAwsRegion("default", cfg)?.region, "eu-west-1");
+    assert.equal(discoverAwsRegion("work", cfg)?.region, "ap-south-1");
+
+    // the environment wins, because that's what the SDKs do
+    process.env.AWS_DEFAULT_REGION = "us-west-2";
+    assert.equal(discoverAwsRegion("default", cfg)?.region, "us-west-2");
+    process.env.AWS_REGION = "us-east-1";
+    const found = discoverAwsRegion("default", cfg)!;
+    assert.equal(found.region, "us-east-1", "AWS_REGION beats AWS_DEFAULT_REGION");
+    assert.equal(found.source, "AWS_REGION", "and the panel says where it came from");
+  } finally {
+    if (prev.r === undefined) delete process.env.AWS_REGION; else process.env.AWS_REGION = prev.r;
+    if (prev.d === undefined) delete process.env.AWS_DEFAULT_REGION; else process.env.AWS_DEFAULT_REGION = prev.d;
   }
 });

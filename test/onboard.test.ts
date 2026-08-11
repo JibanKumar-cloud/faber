@@ -190,3 +190,67 @@ test("a key the provider rejects fails setup; being offline does not", async () 
 
   for (const s of open) s.close();
 });
+
+test("a profile is saved only when it is genuinely usable", async () => {
+  const { setupComplete } = await import("../src/onboard.js");
+
+  // The exact junk that got written after Ctrl-C at a text prompt: not empty,
+  // so every naive "is it set" check passed and the profile looked valid.
+  const ctrlC = await setupComplete({
+    route: "bedrock", model: "\x03\x03", baseUrl: "https://x", apiKey: "k",
+  });
+  assert.equal(ctrlC.complete, false, "control characters are not a model id");
+
+  const blank = await setupComplete({
+    route: "anthropic-api", model: "   ", apiKey: "k",
+  });
+  assert.equal(blank.complete, false, "whitespace is not a model id");
+
+  // and a real one still passes
+  const good = await setupComplete({
+    route: "anthropic-api", model: "claude-sonnet-5", apiKey: "sk-ant-x",
+  });
+  assert.equal(good.complete, true);
+});
+
+test("a pasted answer is accepted; only Ctrl-C cancels", async () => {
+  const { __askTextForTest } = await import("../src/onboard.js");
+  const ask = (reply: string): Promise<string | undefined> =>
+    __askTextForTest({ question: async () => reply } as unknown as
+      import("node:readline/promises").Interface, "name: ");
+
+  // A paste arrives wrapped in bracketed-paste markers. Rejecting every
+  // control character made pasting an answer abort setup entirely.
+  assert.equal(await ask("\x1b[200~ai-engineering-dev\x1b[201~"), "ai-engineering-dev");
+  assert.equal(await ask("  ai-engineering-dev  "), "ai-engineering-dev");
+  assert.equal(await ask("plain-typed"), "plain-typed");
+
+  // Ctrl-C and Ctrl-D still mean stop
+  assert.equal(await ask("\x03"), undefined);
+  assert.equal(await ask("\x04"), undefined);
+});
+
+test("a question about a command is not a command", async () => {
+  const { looksLikeCommand } = await import("../src/commands.js");
+
+  // The exact line that reverted two files while the user was asking how
+  // /undo works. A destructive command must be the whole line.
+  assert.equal(looksLikeCommand(
+    "/undo and /redo how does it work? are we commiting every task?"), false);
+  assert.equal(looksLikeCommand("/undo please explain what this does"), false);
+  assert.equal(looksLikeCommand("/clear the whole conversation history for me"), false);
+
+  // real invocations still work
+  assert.equal(looksLikeCommand("/undo"), true);
+  assert.equal(looksLikeCommand("/redo"), true);
+  assert.equal(looksLikeCommand("  /history  "), true);
+  assert.equal(looksLikeCommand("/memory archived"), true);
+  assert.equal(looksLikeCommand("/map main"), true);
+  assert.equal(looksLikeCommand("/key set BEDROCK_API_KEY"), true);
+  assert.equal(looksLikeCommand("/model gpt-5.3-codex"), true);
+  assert.equal(looksLikeCommand("/usage --refresh-prices"), true);
+  assert.equal(looksLikeCommand("/restore 3"), true);
+
+  // and a question about an argument-taking command is still a question
+  assert.equal(looksLikeCommand("/model what does this even do?"), false);
+});

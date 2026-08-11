@@ -40,6 +40,9 @@ const RETRYABLE = new Set([408, 409, 429, 500, 502, 503, 504, 529]);
  * is not a useful thing to tell someone whose key demonstrably works — the
  * status code or error usually says exactly what went wrong.
  */
+/** Azure pins the API surface by date; this one covers tools and streaming. */
+export const AZURE_API_VERSION = "2024-10-21";
+
 let lastListError: string | undefined;
 export function lastModelListError(): string | undefined { return lastListError; }
 
@@ -80,12 +83,20 @@ export class LLMClient {
    * models route, which says nothing about the key and must not block setup.
    */
   async verifyKey(): Promise<"ok" | "rejected" | "unreachable"> {
+    if (this.config.route === "bedrock") {
+      // The mantle endpoint has no listing to probe, so treat a working
+      // credential discovery as sufficient; a bad one fails on first use.
+      return (await this.listBedrockModels()).length ? "ok" : "unreachable";
+    }
     const anthropic = this.config.provider === "anthropic";
     const url = anthropic ? `${this.config.baseUrl}/v1/models?limit=1`
                           : `${this.config.baseUrl}/models`;
+    const auth = await this.authHeaders(url, "", "GET");
     const headers: Record<string, string> = anthropic
-      ? { "x-api-key": this.config.apiKey!, "anthropic-version": "2023-06-01" }
-      : { authorization: `Bearer ${this.config.apiKey}` };
+      ? { ...auth, "anthropic-version": "2023-06-01" }
+      : this.config.route === "azure-openai"
+        ? { "api-key": this.config.apiKey ?? "" }
+        : (this.config.apiKey ? { authorization: `Bearer ${this.config.apiKey}` } : auth);
     try {
       const ctl = new AbortController();
       const timer = setTimeout(() => ctl.abort(), 8000);
@@ -98,15 +109,82 @@ export class LLMClient {
     }
   }
 
+  /**
+   * Bedrock has no Messages-style listing: the mantle endpoint serves
+   * /v1/messages but returns 404 for /v1/models. AWS's own ListFoundationModels
+   * is the catalogue, on a different host and signed as a normal AWS call.
+   */
+  private async listBedrockModels(): Promise<{ id: string; name?: string }[]> {
+    const region = this.config.region ?? "us-east-1";
+    const url = (this.config as { bedrockCatalogUrl?: string }).bedrockCatalogUrl
+      ?? `https://bedrock.${region}.amazonaws.com/foundation-models`;
+    try {
+      const auth = await this.authHeaders(url, "", "GET");
+      const ctl = new AbortController();
+      const timer = setTimeout(() => ctl.abort(), 8000);
+      const res = await fetch(url, { headers: auth, signal: ctl.signal });
+      clearTimeout(timer);
+      if (!res.ok) { lastListError = `HTTP ${res.status} from ListFoundationModels`; return []; }
+      const body = await res.json() as {
+        modelSummaries?: { modelId?: string; modelName?: string; providerName?: string;
+                           outputModalities?: string[] }[];
+      };
+      return (body.modelSummaries ?? [])
+        .filter((m) => typeof m.modelId === "string"
+          && /anthropic/i.test(m.providerName ?? m.modelId!)
+          // skip image and embedding variants; we only run text
+          && (!m.outputModalities || m.outputModalities.includes("TEXT")))
+        .map((m) => ({ id: m.modelId!, name: m.modelName }));
+    } catch (e) {
+      lastListError = e instanceof Error ? e.message : String(e);
+      return [];
+    }
+  }
+
+  /**
+   * Azure exposes the deployments a subscription has created, not OpenAI's
+   * catalogue: you address `my-gpt5-codex`, a name someone chose, and the
+   * underlying model is a property of it.
+   */
+  private async listAzureDeployments(): Promise<{ id: string; name?: string }[]> {
+    const base = this.config.baseUrl.replace(/\/openai\/deployments\/[^/]+\/?$/, "");
+    const url = `${base}/openai/deployments?api-version=${AZURE_API_VERSION}`;
+    try {
+      const ctl = new AbortController();
+      const timer = setTimeout(() => ctl.abort(), 8000);
+      const res = await fetch(url, {
+        headers: { "api-key": this.config.apiKey ?? "" }, signal: ctl.signal,
+      });
+      clearTimeout(timer);
+      if (!res.ok) { lastListError = `HTTP ${res.status} from ${url}`; return []; }
+      const body = await res.json() as { data?: { id?: string; model?: string }[] };
+      return (body.data ?? [])
+        .filter((d): d is { id: string; model?: string } => typeof d.id === "string")
+        // the deployment name is what you call; the model is what it runs
+        .map((d) => ({ id: d.id, name: d.model }));
+    } catch (e) {
+      lastListError = e instanceof Error ? e.message : String(e);
+      return [];
+    }
+  }
+
   async listModels(signal?: AbortSignal): Promise<{ id: string; name?: string; created?: number }[]> {
+    if (this.config.route === "bedrock") return this.listBedrockModels();
+    if (this.config.route === "azure-openai") return this.listAzureDeployments();
     lastListError = undefined;
     const anthropic = this.config.provider === "anthropic";
     const url = anthropic
       ? `${this.config.baseUrl}/v1/models?limit=100`
       : `${this.config.baseUrl}/models`;
+    // Sign when the route authenticates with AWS credentials. Sending an
+    // empty x-api-key here failed silently, which left setup with no models
+    // and a default that doesn't exist on Bedrock.
+    const auth = await this.authHeaders(url, "", "GET");
     const headers: Record<string, string> = anthropic
-      ? { "x-api-key": this.config.apiKey!, "anthropic-version": "2023-06-01" }
-      : { authorization: `Bearer ${this.config.apiKey}` };
+      ? { ...auth, "anthropic-version": "2023-06-01" }
+      : this.config.route === "azure-openai"
+        ? { "api-key": this.config.apiKey ?? "" }
+        : (this.config.apiKey ? { authorization: `Bearer ${this.config.apiKey}` } : auth);
     try {
       const ctl = new AbortController();
       const timer = setTimeout(() => ctl.abort(), 6000);
@@ -142,7 +220,16 @@ export class LLMClient {
    * Auth for one request. An API key is a header; AWS credentials mean signing
    * the whole request, which is how an IAM role authenticates with no key.
    */
-  private async authHeaders(url: string, body: string): Promise<Record<string, string>> {
+  private async authHeaders(
+    url: string, body: string, method = "POST",
+  ): Promise<Record<string, string>> {
+    // Foundry authenticates the Azure way: an api-key header, or a bearer
+    // token if one was minted from Entra ID.
+    if (this.config.route === "foundry" && this.config.apiKey) {
+      return /^ey[A-Za-z0-9_-]+\./.test(this.config.apiKey)
+        ? { authorization: `Bearer ${this.config.apiKey}` }   // an Entra token
+        : { "api-key": this.config.apiKey };
+    }
     if (this.config.apiKey) return { "x-api-key": this.config.apiKey };
     if (this.config.route !== "bedrock") return {};
     awsCredsPromise ??= discoverAwsCredentials();
@@ -155,7 +242,7 @@ export class LLMClient {
       );
     }
     return signRequest({
-      method: "POST",
+      method,
       url,
       body,
       region: this.config.region ?? "us-east-1",
@@ -317,8 +404,19 @@ export class LLMClient {
         function: { name: t.name, description: t.description, parameters: t.input_schema },
       }));
     }
-    const res = await this.post(`${this.config.baseUrl}/chat/completions`, {
-      Authorization: `Bearer ${this.config.apiKey}`,
+    // Azure authenticates with api-key rather than a bearer token, and pins
+    // the API version as a query parameter.
+    const azure = this.config.route === "azure-openai";
+    // On Azure the deployment name goes in the path, and the model field in
+    // the body is ignored — the deployment decides which model runs.
+    const chatUrl = azure
+      ? `${this.config.baseUrl}/deployments/${encodeURIComponent(modelOverride ?? this.config.model)}` +
+        `/chat/completions?api-version=${AZURE_API_VERSION}`
+      : `${this.config.baseUrl}/chat/completions`;
+    const res = await this.post(chatUrl, {
+      ...(azure
+        ? { "api-key": this.config.apiKey! }
+        : { Authorization: `Bearer ${this.config.apiKey}` }),
       "content-type": "application/json",
     }, body, signal);
 

@@ -263,3 +263,29 @@ test("long menus filter as you type; short ones keep number shortcuts", async ()
   const few = ["Anthropic", "OpenAI", "Local"];
   assert.equal(few[await drive(few, "2")], "OpenAI");
 });
+
+test("a sentence about a command is a task, not the command", async () => {
+  const { looksLikeCommand } = await import("../src/commands.js");
+
+  // The exact input that reverted files while the user was asking a question.
+  assert.equal(looksLikeCommand(
+    "/undo and /redo how does it work? are we commiting every task?"), false);
+  assert.equal(looksLikeCommand("/clear the cache and tell me what changed"), false);
+  assert.equal(looksLikeCommand("/compact this function please"), false);
+
+  // Real invocations still work, including the ones that take arguments.
+  assert.equal(looksLikeCommand("/undo"), true);
+  assert.equal(looksLikeCommand("/usage --refresh-prices"), true);
+  assert.equal(looksLikeCommand("/model gpt-5.3-codex"), true);
+  assert.equal(looksLikeCommand("/key set ANTHROPIC_API_KEY"), true);
+  assert.equal(looksLikeCommand("/map main"), true);
+  assert.equal(looksLikeCommand("  /undo  "), true, "surrounding space is fine");
+
+  // Too many arguments for what the command takes: prose.
+  assert.equal(looksLikeCommand("/map main and then explain the flow to me"), false);
+  assert.equal(looksLikeCommand("/key set A B C D"), false);
+
+  // Not a command at all — let the agent see it.
+  assert.equal(looksLikeCommand("/notacommand"), false);
+  assert.equal(looksLikeCommand("fix the parser"), false);
+});

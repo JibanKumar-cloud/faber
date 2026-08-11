@@ -291,6 +291,23 @@ export async function refreshPrices(
  * id, then normalized), then the built-in table. Undefined means "unknown",
  * which the ledger renders as — rather than guessing.
  */
+/**
+ * Azure's US Data Zone deployments bill at 1.1x. Applying it keeps the ledger
+ * honest for teams who chose that deployment for data-residency reasons —
+ * under-reporting spend is the one direction a cost tool must not err in.
+ */
+export const US_DATA_ZONE_MULTIPLIER = 1.1;
+
+export function scalePrice(p: ModelPrice, factor: number): ModelPrice {
+  const r = (n: number): number => Math.round(n * factor * 1e6) / 1e6;
+  return {
+    ...p,
+    in: r(p.in), out: r(p.out),
+    cacheRead: p.cacheRead === undefined ? undefined : r(p.cacheRead),
+    cacheWrite: p.cacheWrite === undefined ? undefined : r(p.cacheWrite),
+  };
+}
+
 export function priceFor(
   modelId: string,
   override?: { in?: number; out?: number },

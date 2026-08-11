@@ -58,6 +58,24 @@ export const ROUTES: Route[] = [
     implemented: true,
   },
   {
+    // Claude hosted on Azure through Microsoft Foundry. It speaks the same
+    // Messages API as the direct route, so this is a base URL and an auth
+    // header rather than a new wire — the migration Microsoft describes as
+    // "swap the base URL and authentication, keep the calls the same".
+    id: "foundry",
+    vendor: "Anthropic",
+    label: "Microsoft Foundry (Azure)",
+    hint: "your Azure subscription owns auth and billing",
+    wire: "anthropic",
+    needsBaseUrl: true,
+    // Its own variable: a Foundry resource is separate from an Azure OpenAI
+    // one, with its own key. Sharing the name meant a key saved for GPT
+    // deployments was offered for Claude, where it cannot work.
+    keyEnv: "AZURE_FOUNDRY_API_KEY",
+    aliasesArePinned: true,   // you address a deployment someone named
+    implemented: true,
+  },
+  {
     id: "vertex",
     vendor: "Anthropic",
     label: "Google Vertex AI",
@@ -65,6 +83,21 @@ export const ROUTES: Route[] = [
     wire: "anthropic",
     aliasesArePinned: true,
     implemented: false,   // needs Google OAuth
+  },
+  {
+    // Azure hosts OpenAI's models under a company's own subscription, which is
+    // the answer for someone who wants codex billed through work rather than a
+    // personal card. Same wire as OpenAI, but the key travels in its own
+    // header and the deployment name lives in the URL.
+    id: "azure-openai",
+    vendor: "OpenAI",
+    label: "Azure OpenAI",
+    hint: "your Azure subscription owns auth and billing",
+    wire: "openai",
+    needsBaseUrl: true,
+    keyEnv: "AZURE_OPENAI_API_KEY",
+    aliasesArePinned: true,   // you address deployments, not model ids
+    implemented: true,
   },
   {
     id: "openai-api",

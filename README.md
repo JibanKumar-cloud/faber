@@ -5,7 +5,7 @@
 *Faber — Latin for craftsman. Yours lives at `faber`.*
 * Read: [Faber Medium](https://medium.com/@jshial25/why-should-an-ai-coding-agent-read-hundreds-of-files-to-answer-one-question-d6369d29dfa5?postPublishedType=repub)
 ## Code Graph
-<img width="636" height="573" alt="Screenshot 2026-08-09 at 2 58 30 PM" src="https://github.com/user-attachments/assets/176e5093-8e29-452f-a749-d06a561c583a" />
+<img width="636" height="573" alt="Screenshot 2026-08-09 at 2 58 30 PM" src="https://github.com/user-attachments/assets/176e5093-8e29-452f-a749-d06a561c583a" />
 
 ## Demo 
 <img width="1240" height="700" alt="terminal_demo_compressed" src="https://github.com/user-attachments/assets/f78a8f68-130e-4f37-90f2-7a7089fa2653" />
@@ -21,7 +21,7 @@ faber               # start the REPL (approval mode is on by default)
 1. **Give it a real task.** Try `add a comment explaining what the main entry file does`
 2. **Approve the diff** with the arrow keys and Enter. Cursor starts on Yes; "Always this session" grants trust. Shell commands ask too.
 3. **See the safety net.** `/history` lists every task with the files it touched.
-4. **Undo it.** `/undo` reverts the task, and if you change your mind changed your mind? `/redo` brings it back. Nothing is ever lost in either direction.
+4. **Undo it.** `/undo` reverts the task, and `/redo` brings it back. Nothing is ever lost in either direction.
 5. **Come back tomorrow.** `faber --resume` continues the conversation, or just ask *"what did we do last time?"* — it searches past sessions itself.
 
 That loop of task, approve, inspect, revert is the whole trust model. Everything else is detail.
@@ -30,7 +30,7 @@ That loop of task, approve, inspect, revert is the whole trust model. Everything
 
 **It has a map, not just eyes.** The code graph stores call and import *edges*, incrementally updated in milliseconds. One ~50-token query (`trace_path(main, saveUser)` → `main → startServer → handleSignup → saveUser`) replaces reading thousands of tokens of files. `/map main` prints the call tree — the "trace it from main" ritual every programmer does, automated.
 
-**Every model you can reach, including the coding ones.** Claude through the Anthropic API or your own AWS account, OpenAI through both of its APIs — chat completions and the Responses API that the codex family requires — plus anything OpenAI-compatible, and local models through Ollama for no key and no cost. Faber reads which endpoint each model needs and routes there itself, so `gpt-5.3-codex` and `claude-opus-5` are both just entries in the same list, priced side by side.
+**Every model you can reach, including the coding ones.** Claude through the Anthropic API, your own AWS account, or Microsoft Foundry on Azure. OpenAI through both of its APIs — chat completions and the Responses API that the codex family requires — directly or through your Azure subscription. Plus anything OpenAI-compatible, and local models through Ollama for no key and no cost. Faber reads which endpoint each model needs and routes there itself, so `gpt-5.3-codex` and `claude-opus-5` are both just entries in the same list, priced side by side.
 
 **It's honest about money.** Prompt caching marks the stable prefix of every request, so repeat loop iterations pay ~10% for tokens already sent. Every task is costed and recorded as it runs, so `/usage` is a ledger of what you actually spent rather than an estimate — broken down by time window and by model, with the cheapest option always visible next to the one you're using.
 
@@ -40,9 +40,45 @@ That loop of task, approve, inspect, revert is the whole trust model. Everything
 
 **You can steer it mid-flight.** See it going the wrong way? Just type `use TypeScript, not JavaScript` — and your guidance is injected at the next loop iteration. No cancelling, no wasted tokens.
 
+## Upgrading from Codewright
+
+Faber is Codewright renamed, after the npm name was taken between building and releasing. Existing `.codewright/` state directories are adopted automatically; `CW_*` environment variables still work alongside `FABER_*`.
+
 ## Requirements & install
 
-You need Node.js 22.5 or newer. Faber uses Node's built-in SQLite, so there are no native dependencies to compile and installs don't fail on a missing toolchain. The only runtime dependencies are two small pure-JS packages.
+Faber needs **Node.js 22.5 or newer**. It uses Node's built-in SQLite, so there are no native dependencies to compile and installs don't fail on a missing toolchain. The only runtime dependencies are two small pure-JS packages.
+
+Check your version:
+
+```bash
+node --version
+```
+
+If it prints `v22.5.0` or higher, skip ahead to Install.
+
+### Installing Node.js
+
+The recommended way is **nvm**, which lets you switch versions per project without touching your system:
+
+```bash
+# macOS / Linux
+curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash
+# restart your terminal, or: source ~/.zshrc
+nvm install 22
+nvm use 22
+```
+
+Alternatives:
+
+```bash
+brew install node              # macOS, Homebrew
+winget install OpenJS.NodeJS   # Windows
+sudo apt install nodejs npm    # Debian/Ubuntu — often ships an older version; prefer nvm
+```
+
+Or download an installer from [nodejs.org](https://nodejs.org). Already on Node but below 22.5? `nvm install 22 && nvm use 22`, or `brew upgrade node`.
+
+### Install Faber
 
 ```bash
 npm install -g faberwright
@@ -93,10 +129,18 @@ Setup is skipped entirely when there's no terminal attached, so scripts and CI n
 
 ## Features
 
-| Feature|Description |
+| | |
 |---|---|
 | **Streaming agent loop** | Text renders as generated, with a live heartbeat (`✳ Working… 14s`) that never interleaves with output and ends in `✳ Worked for 14s`. Plan → tool → observe → adjust, until done. Hard iteration cap. |
 | **Code graph** | Symbols *and* call/import edges, incrementally maintained (only changed files re-parse). Agent tools: `who_calls` (blast radius), `calls_from` (dependencies), `trace_path` (workflow chain). A compact repo map of the most-connected symbols orients every task. Edges are static hints — dynamic dispatch/DI/events aren't captured; the agent reads code where precision matters. |
+| **Approval by default** | Arrow-key menu on every file edit (colored diff) and every shell command. `--auto` / `/auto` / `FABER_APPROVAL=auto` opts into autonomy. |
+| **Two OpenAI APIs** | Chat completions and the Responses API, chosen per model from the endpoint each one publishes. The codex family works without configuration. |
+| **Guided setup** | First run walks through vendor, route, credential and model, then remembers it. Later launches verify the setup can reach a model before opening the prompt. Nothing is saved until setup finishes, so an interrupted run leaves no half-configured state. |
+| **Credentials** | Keys live in `~/.faber/credentials.json`, owner-only, outside every repository. Faber checks that what you paste looks like a key before storing it, hides it as you type, and never prints more than a masked fragment. Environment variables keep working and take precedence. |
+| **Interactive choices** | Genuinely ambiguous request? The agent presents 2–4 options plus "Chat more about this instead" before writing code. |
+| **Mid-task steering** | Type while it works; guidance is injected at the next loop boundary. If the model finishes while steering is queued, the task continues instead. Steering markers carry a per-task nonce, so hostile file contents can't impersonate you. |
+| **Paste as chips** | Raw-mode composer: pasting a 50-line block renders only a chip — `[pasted #1 +50 lines]` — never the code itself, while the full text is expanded into the message on Enter. Paste the same block again to expand it visibly. Paste, type, paste again: one submission. Full line editing: arrows, Home/End, forward-delete, Ctrl-A/E/K/U, Up/Down history; long drafts wrap across rows with exact cursor tracking — backspace and arrows travel across wrap boundaries. Chips are atomic — one arrow step, one backspace.  Works at the prompt and while steering. |
+| **Reversible history** | `/history` lists tasks with files touched; `/restore <id>` jumps anywhere; `/undo` / `/redo` — restores are never destructive. |
 | **Git-aware** | Warns about uncommitted changes at startup. Optional `FABER_GIT=commit`: one commit per completed *task* (never per edit). The agent never commits by default. |
 | **Two-layer memory** | Short-term: token-budgeted window, auto-summarized past 60k (tool pairs never split). Long-term: SQLite+FTS5 facts/decisions/gotchas + per-file notes, with full lifecycle (`/forget`, `/archive`, `/prune`). |
 | **Sessions** | Crash-safe JSONL transcripts; `--resume`; last-session digest injected at startup; `recall_sessions` keyword search across history. |
@@ -106,11 +150,6 @@ Setup is skipped entirely when there's no terminal attached, so scripts and CI n
 | **Usage dashboard** | `/usage` shows a persistent ledger: tasks, tokens, cache rate, cost, and cache *savings* — for this session, today, and all time, plus totals across every project on the machine. Costs use each model's own rates, including its exact cache read/write prices, so a history spanning a model switch stays accurate. Prices ship built in and update with `/usage --refresh-prices`. Records live in `.faber/usage.db` per project and survive restarts. |
 | **Error recovery** | Transient API errors: backoff + jitter, honors Retry-After. Tool errors return to the model to self-correct. Identical call failing twice → warning; three times → clean abort. Ctrl-C aborts streams *and* running commands; checkpoints survive. |
 | **Safety rails** | Symlink-resolved path jail, shell denylist, timeouts, output truncation, atomic writes (temp+rename), stale-edit guard. Guardrails, not a sandbox — use a container for untrusted code. |
-| **Approval by default** | Arrow-key menu on every file edit (colored diff) and every shell command. `--auto` / `/auto` / `FABER_APPROVAL=auto` opts into autonomy. |
-| **Guided setup** | First run walks through vendor, route, credential and model, then remembers it. Later launches verify the setup can reach a model before opening the prompt. Nothing is saved until setup finishes, so an interrupted run leaves no half-configured state. |
-| **Credentials** | Keys live in `~/.faber/credentials.json`, owner-only, outside every repository. Faber checks that what you paste looks like a key before storing it, hides it as you type, and never prints more than a masked fragment. Environment variables keep working and take precedence. |
-| **Mid-task steering** | Type while it works; guidance is injected at the next loop boundary. If the model finishes while steering is queued, the task continues instead. Steering markers carry a per-task nonce, so hostile file contents can't impersonate you. |
-| **Reversible history** | `/history` lists tasks with files touched; `/restore <id>` jumps anywhere; `/undo` / `/redo` — restores are never destructive. |
 
 ## Vendors, routes, and models
 
@@ -122,21 +161,23 @@ Faber separates three choices, so you can change one without redoing the others:
 | **Route** | how you reach it and who owns auth | `/route` |
 | **Model** | which model on that route | `/model` (searchable model options) |
 
-Routes available today: **Anthropic API**, **Amazon Bedrock**, **OpenAI API**, **Ollama** (local, no key and no cost), and any **OpenAI-compatible endpoint** (OpenRouter, Groq, Together, vLLM, a gateway). Google Vertex is defined but not yet wired up, and `/route` says so rather than failing at request time.
+Routes available today: **Anthropic API**, **Amazon Bedrock**, **Microsoft Foundry**, **OpenAI API**, **Azure OpenAI**, **Ollama** (local, no key and no cost), and any **OpenAI-compatible endpoint** (OpenRouter, Groq, Together, vLLM, a gateway). Google Vertex is defined but not yet wired up, and `/route` says so rather than failing at request time.
 
 On OpenAI, Faber speaks both APIs. Chat completions for most models, and the **Responses API** for the ones that require it, which includes the codex family — the coding-tuned models a coding agent actually wants. You don't choose: each model's endpoint is recorded in the price dataset Faber already downloads, so `gpt-5.3-codex` routes to `/v1/responses` and `gpt-5.5` to `/v1/chat/completions` automatically. If a model is too new to appear in that dataset and the API says it belongs elsewhere, Faber retries on the endpoint it names rather than failing.
 
 ### Amazon Bedrock
 
-Faber authenticates two ways, and tries them in this order.
+Setup asks how you want to authenticate, because the choice affects who gets billed.
 
-**With an IAM role, which needs no key at all.** In SageMaker Studio, on EC2, in ECS or Lambda, or on a laptop where you've run `aws configure`, Faber finds your AWS credentials the same way the SDKs do and signs each request with SigV4. Pick Amazon Bedrock during setup, give it a region, and that's the whole configuration. The signing is implemented directly against Node's crypto module rather than pulling in the AWS SDK, so the zero-dependency install still holds, and it's verified against the signature AWS publishes for its own worked example.
+**AWS credentials (IAM role)** needs no key at all. In SageMaker Studio, on EC2, in ECS or Lambda, or on a laptop where you've run `aws configure`, Faber finds your credentials the same way the SDKs do and signs each request with SigV4. The region comes from `AWS_REGION` or `~/.aws/config` when it's there, so usually nothing is asked at all. Signing is implemented directly against Node's crypto module rather than pulling in the AWS SDK, and is verified against the signature AWS publishes for its own worked example.
 
-**With a Bedrock API key**, if you'd rather use one:
+**A Bedrock API key** bills through that key instead:
 
 ```bash
 export BEDROCK_API_KEY=...
 ```
+
+Either path must complete: pick the role with no credentials present, or the key without entering one, and setup saves nothing and starts over next time.
 
 Model ids on Bedrock differ by region and deployment, so pin them per alias in your profile instead of relying on the built-in names:
 
@@ -144,6 +185,28 @@ Model ids on Bedrock differ by region and deployment, so pin them per alias in y
 { "route": "bedrock", "region": "us-west-2",
   "modelPins": { "sonnet": "anthropic.claude-sonnet-4-6-v1" },
   "apiKeyEnv": "BEDROCK_API_KEY" }
+```
+
+### Claude on Azure (Microsoft Foundry)
+
+Claude has been generally available in Microsoft Foundry since June 2026, hosted on Azure with your organisation's own authentication, billing and governance — usage appears on the Azure invoice and can count toward a Microsoft Azure Consumption Commitment.
+
+It serves the same Messages API as the direct route, so for Faber this is a base URL and an auth header rather than a new protocol: prompt caching, extended thinking and tool streaming all work unchanged. Setup asks for your resource name and takes either a subscription key or a token minted from Entra ID, recognising which you gave it.
+
+```bash
+export AZURE_FOUNDRY_API_KEY=...
+```
+
+A Foundry resource is separate from an Azure OpenAI one and has its own key, so the two never share a credential.
+
+### Azure OpenAI
+
+The answer for anyone who wants OpenAI's coding models billed through their employer rather than a personal card: AWS doesn't host OpenAI models, so Bedrock isn't the route for them — Azure is.
+
+Setup asks for your resource name rather than a URL, since that's the part people know from the portal, and builds the endpoint from it. Azure addresses **deployments** rather than model ids: you call `my-codex-deployment`, a name someone in your organisation chose, and the deployment decides which model runs. Faber lists the deployments your subscription has created and shows the model behind each one.
+
+```bash
+export AZURE_OPENAI_API_KEY=...
 ```
 
 ### Costs
@@ -177,9 +240,8 @@ model        gpt-5.3-codex     which model ran it
 cost         0.0412            dollars, frozen at run time
 saved        0.0231            what caching avoided
 ```
-**Cost metrics `/usage`:
 
-<img width="636" height="388" alt="Screenshot 2026-08-10 at 12 25 57 AM" src="https://github.com/user-attachments/assets/33ba06ce-69ad-4afe-afcc-6119a897e67a" />
+<img width="636" height="388" alt="Screenshot 2026-08-10 at 12 25 57 AM" src="https://github.com/user-attachments/assets/33ba06ce-69ad-4afe-afcc-6119a897e67a" />
 
 
 Counters and a timestamp. No prompts, no code, no file contents. Around 80 bytes a row, so a year of heavy use is roughly a megabyte, and nothing is ever pruned.
@@ -244,6 +306,8 @@ Flags: `faber [task] [--workspace|-w <dir>] [--resume] [--ask|--auto] [--version
 | `FABER_ROUTE`, `FABER_REGION` | route id and region, overriding the profile |
 | `FABER_AUTO_PRICES` | `0` disables the background price refresh |
 | `BEDROCK_API_KEY` | Bedrock, when you'd rather use a key than an IAM role |
+| `AZURE_OPENAI_API_KEY` | Azure OpenAI, for GPT deployments in your subscription |
+| `AZURE_FOUNDRY_API_KEY` | Microsoft Foundry, for Claude on Azure (a separate resource) |
 | `AWS_ACCESS_KEY_ID` etc. | picked up automatically for Bedrock's SigV4 signing |
 
 Faber keeps three files. `~/.faber/settings.json` holds your profiles, which is the route, model and which environment variable a credential comes from. `~/.faber/credentials.json` holds the keys themselves, owner-only and outside every repository. A project can override the profile with its own `.faber/config.json`, which is useful when one repo should use a cheaper model than the rest.

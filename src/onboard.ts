@@ -28,6 +28,8 @@ const KEY_SOURCE: Record<string, string> = {
   ANTHROPIC_API_KEY: "https://console.anthropic.com/settings/keys",
   OPENAI_API_KEY: "https://platform.openai.com/api-keys",
   BEDROCK_API_KEY: "the AWS console (Bedrock → API keys)",
+  AZURE_OPENAI_API_KEY: "the Azure portal (your OpenAI resource → Keys and Endpoint)",
+  AZURE_FOUNDRY_API_KEY: "the Azure portal (your Foundry resource → Keys and Endpoint)",
 };
 
 export function needsOnboarding(): boolean {
@@ -60,7 +62,12 @@ export async function setupComplete(cfg: {
   if (!route.implemented) {
     return { complete: false, missing: `${route.label} isn't wired up yet`, fix: "/route" };
   }
-  if (!cfg.model) return { complete: false, missing: "no model chosen", fix: "/model" };
+  // Not merely "is it set": an interrupted prompt used to store control
+  // characters, which are non-empty and so passed every naive check.
+  // eslint-disable-next-line no-control-regex
+  if (!cfg.model || !cfg.model.trim() || /[\x00-\x1f]/.test(cfg.model)) {
+    return { complete: false, missing: "no model chosen", fix: "/model" };
+  }
   if (route.needsBaseUrl && !cfg.baseUrl) {
     return { complete: false, missing: "no endpoint URL for this route", fix: "/route" };
   }
@@ -108,6 +115,39 @@ async function readKey(
   }
   return key;
 }
+
+/**
+ * Read a plain answer, treating an interrupt as cancellation.
+ *
+ * A raw readline prompt collects Ctrl-C as the character \x03 rather than
+ * aborting, so pressing it during the region or model question stored control
+ * characters as the answer — and since they aren't empty, every completeness
+ * check passed and the profile was saved as valid.
+ */
+async function askText(
+  rl: readline.Interface, prompt: string,
+): Promise<string | undefined> {
+  let raw: string;
+  try { raw = await rl.question(prompt); } catch { return undefined; }
+
+  // Ctrl-C is the only thing that means "stop". Everything else that isn't
+  // printable is terminal noise: a paste arrives wrapped in bracketed-paste
+  // markers, so rejecting all control characters made pasting an answer
+  // abort setup — which is exactly what someone does with a resource name.
+  // eslint-disable-next-line no-control-regex
+  if (/[\x03\x04]/.test(raw)) return undefined;
+  const cleaned = raw
+    // eslint-disable-next-line no-control-regex
+    .replace(/\x1b\[20[01]~/g, "")
+    // eslint-disable-next-line no-control-regex
+    .replace(/\x1b\[[0-9;]*[A-Za-z~]/g, "")
+    // eslint-disable-next-line no-control-regex
+    .replace(/[\x00-\x1f\x7f]/g, "");
+  return cleaned.trim();
+}
+
+/** Exposed for tests: paste handling here decides whether setup can finish. */
+export const __askTextForTest = askText;
 
 export interface OnboardResult {
   profile: Profile;
@@ -223,13 +263,43 @@ export async function ensureCredential(
   }
 
   if (route.id === "bedrock") {
-    // Bedrock can sign with an IAM role, so a key may not be needed at all.
+    // Two ways in, and which one you pick can matter for billing: an IAM role
+    // charges through the account that owns it, a Bedrock API key can belong
+    // to a different arrangement entirely. So ask rather than assume, even
+    // when one option is obvious from the environment.
     const { discoverAwsCredentials } = await import("./sigv4.js");
     const aws = await discoverAwsCredentials();
     console.log();
-    console.log(aws
-      ? pc.dim(`  No key needed — signing with AWS credentials from ${aws.source}.`)
-      : pc.yellow(`  No AWS credentials found. Set ${route.keyEnv}, or run where an IAM role is available.`));
+    const how = await select(rl, "How should Faber authenticate with AWS?", [
+      `AWS credentials (IAM role)       ${pc.dim(aws ? `found: ${aws.source}` : "none found here")}`,
+      `Bedrock API key                  ${pc.dim("billed through that key instead")}`,
+    ]);
+
+    if (how === 0) {
+      if (!aws) {
+        // Nothing to sign with, so setup did not succeed and saves nothing.
+        console.log(pc.yellow("  No AWS credentials on this machine."));
+        console.log(pc.dim("  Run where an IAM role is available (SageMaker, EC2, ECS), or `aws configure`."));
+        return { switchedTo: "quit" };
+      }
+      console.log(pc.dim(`  Signing automatically with your AWS role. No key needed.`));
+      delete profile.apiKeyEnv;   // this route authenticates by signing
+      return {};
+    }
+
+    console.log();
+    console.log("Faber needs a Bedrock API key.");
+    const where = KEY_SOURCE[route.keyEnv];
+    if (where) console.log(pc.dim(`  Get one at ${where}`));
+    const key = await readKey(rl, route.keyEnv, `  ${route.keyEnv} (hidden): `);
+    if (!key) {
+      console.log(pc.yellow("  No key entered — setup not completed, nothing saved."));
+      return { switchedTo: "quit" };
+    }
+    saveCredential(route.keyEnv, key);
+    profile.apiKeyEnv = route.keyEnv;
+    profile.preferStoredKey = true;   // an explicit choice beats a role
+    console.log(pc.dim(`  saved (${maskCredential(key)}) — kept on this computer only`));
     return {};
   }
 
@@ -306,14 +376,6 @@ async function finish(
   const profile: Profile = { ...base, route: route.id };
   const activeRoute = route;
 
-  if (route.needsRegion) {
-    const ans = (await rl.question(`AWS region [${DEFAULT_REGION}]: `)).trim();
-    profile.region = ans || DEFAULT_REGION;
-  }
-  if (route.needsBaseUrl) {
-    const ans = (await rl.question("Base URL of the OpenAI-compatible endpoint: ")).trim();
-    if (ans) profile.baseUrl = ans;
-  }
   if (route.keyEnv) {
     profile.apiKeyEnv = route.keyEnv;
     const outcome = await ensureCredential(rl, activeRoute, profile);
@@ -321,6 +383,44 @@ async function finish(
       // Nothing is written: an incomplete profile would make the next run
       // look configured when it isn't.
       return { profile, route: activeRoute, aborted: true };
+    }
+  }
+
+  if (route.id === "foundry") {
+    // Same question as Azure OpenAI: the resource name is what people know.
+    const res = await askText(rl, "Azure resource name (from your endpoint URL): ");
+    if (res === undefined) return { profile, route: activeRoute, aborted: true };
+    if (res) {
+      profile.baseUrl = /^https?:\/\//.test(res)
+        ? res.replace(/\/+$/, "")
+        : `https://${res}.services.ai.azure.com/anthropic`;
+    }
+  } else if (route.id === "azure-openai") {
+    // Ask for the resource name rather than a URL: it's the part people know
+    // from the portal, and the rest of the endpoint is fixed.
+    const res = await askText(rl, "Azure resource name (from your endpoint URL): ");
+    if (res === undefined) return { profile, route: activeRoute, aborted: true };
+    if (res) {
+      profile.baseUrl = /^https?:\/\//.test(res)
+        ? res.replace(/\/+$/, "")
+        : `https://${res}.openai.azure.com/openai`;
+    }
+  } else if (route.needsBaseUrl) {
+    const ans = await askText(rl, "Base URL of the OpenAI-compatible endpoint: ");
+    if (ans === undefined) return { profile, route: activeRoute, aborted: true };
+    if (ans) profile.baseUrl = ans;
+  }
+  if (route.needsRegion) {
+    // Only ask when the environment hasn't already answered.
+    const { discoverAwsRegion } = await import("./sigv4.js");
+    const found = discoverAwsRegion();
+    if (found) {
+      profile.region = found.region;
+      console.log(pc.dim(`  Region ${found.region} (from ${found.source}) · /route to change`));
+    } else {
+      const ans = await askText(rl, `AWS region [${DEFAULT_REGION}]: `);
+      if (ans === undefined) return { profile, route: activeRoute, aborted: true };
+      profile.region = ans || DEFAULT_REGION;
     }
   }
 
@@ -381,18 +481,39 @@ async function finish(
     profile.model = options[mi]!.id;      // a concrete id, never an alias
   } else {
     const hint = activeRoute.id === "ollama" ? "qwen2.5-coder" : "";
-    const ans = (await rl.question(
-      `Model id${hint ? ` [${hint}]` : ""}: `,
-    )).trim();
+    const ans = await askText(rl, `Model id${hint ? ` [${hint}]` : ""}: `);
+    if (ans === undefined) return { profile, route: activeRoute, aborted: true };
     profile.model = ans || hint || undefined;
+  }
+
+  // Nothing is written unless the result is genuinely usable. Every earlier
+  // exit already returns aborted, but this is the single place that decides,
+  // so a future step can't accidentally save a half-finished profile.
+  const check = await setupComplete({
+    route: profile.route,
+    model: profile.model,
+    baseUrl: profile.baseUrl ?? baseUrlFor(activeRoute, profile.region),
+    apiKey: activeRoute.keyEnv ? credentialSource(activeRoute.keyEnv)?.value : undefined,
+  });
+  if (!check.complete) {
+    console.log();
+    console.log(pc.yellow(`Setup not completed — ${check.missing}.`));
+    console.log(pc.dim("  Nothing was saved. Run faber again to start over."));
+    return { profile, route: activeRoute, aborted: true };
   }
 
   const settings = loadSettings();
   settings.profiles[settings.activeProfile] = profile;
   saveSettings(settings);
 
-  const missingKeyEnv = activeRoute.keyEnv && !credentialSource(activeRoute.keyEnv)
+  // Bedrock signs with an IAM role when one is available, so a missing key is
+  // not "one thing left" — saying so contradicts the line printed moments ago.
+  let missingKeyEnv = activeRoute.keyEnv && !credentialSource(activeRoute.keyEnv)
     ? activeRoute.keyEnv : undefined;
+  if (missingKeyEnv && activeRoute.id === "bedrock") {
+    const { discoverAwsCredentials } = await import("./sigv4.js");
+    if (await discoverAwsCredentials()) missingKeyEnv = undefined;
+  }
   return { profile, route: activeRoute, missingKeyEnv };
 }
 
