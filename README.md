@@ -1,4 +1,8 @@
-# Faber
+<p align="center">
+  <img src="docs/faber-logo.png" width="160" alt="Faber logo">
+</p>
+
+<h1 align="center">Faber</h1>
 
 **A cost and performance efficient agentic AI coding assistant for your terminal.** Give it a task in plain English; it explores your repository, edits files with your approval, runs your tests, and remembers your project across sessions.
 
