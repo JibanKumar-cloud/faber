@@ -1,6 +1,6 @@
 {
   "name": "faberwright",
-  "version": "0.4.2",
+  "version": "0.4.3",
   "description": "Faber: an agentic AI coding assistant for your terminal — streams, edits with diff approval, runs your tests, and remembers your project across sessions.",
   "type": "module",
   "license": "Apache-2.0",
