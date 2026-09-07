@@ -1,8 +1,7 @@
-<p align="center">
-  <img src="docs/faber-logo.png" width="100%" alt="Faber">
-</p>
-
-<h1 align="center">Faber</h1>
+<div align="center">
+  <img src="docs/faber-banner.png" width="100%" alt="Faber">
+  <h1>Faber</h1>
+</div>
 
 <p align="center">
   <a href="https://www.npmjs.com/package/faberwright">
