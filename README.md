@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/faber-banner.png" width="100%" alt="Faber">
+  <img src="docs/faber-logo.png" width="100%" alt="Faber">
 </p>
 
 <h1 align="center">Faber</h1>
