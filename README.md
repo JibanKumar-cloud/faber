@@ -4,6 +4,12 @@
 
 <h1 align="center">Faber</h1>
 
+<p align="center">
+  <a href="https://www.npmjs.com/package/faberwright">
+    <img src="https://faber-npm-badge.faber-tools.workers.dev" alt="Faber npm downloads">
+  </a>
+</p>
+
 **A cost and performance efficient agentic AI coding assistant for your terminal.** Give it a task in plain English; it explores your repository, edits files with your approval, runs your tests, and remembers your project across sessions.
 
 *Faber — Latin for craftsman. Yours lives at `faber`.*
