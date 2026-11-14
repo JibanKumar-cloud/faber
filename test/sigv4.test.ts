@@ -162,12 +162,15 @@ test("bedrock lists models through AWS, since the mantle endpoint has none", asy
       listBedrockModels: () => Promise<{ id: string; name?: string }[]>
     }).listBedrockModels.call({
       ...llm,
-      config: { region: "us-east-1", route: "bedrock" },
+      config: { region: "us-east-1", route: "bedrock", bedrockCatalogUrl: `${url}/foundation-models` },
       authHeaders: (llm as unknown as {
         authHeaders: (u: string, b: string, m: string) => Promise<Record<string, string>>
       }).authHeaders.bind(llm),
     });
     assert.ok(Array.isArray(models));
+    assert.equal(models.length, 2);
+    assert.equal(seenPath, "/foundation-models");
+    assert.match(seenAuth, /^AWS4-HMAC-SHA256/);
   } finally {
     s.close();
     if (prev.id === undefined) delete process.env.AWS_ACCESS_KEY_ID; else process.env.AWS_ACCESS_KEY_ID = prev.id;

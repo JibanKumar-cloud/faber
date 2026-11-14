@@ -217,7 +217,7 @@ test("switching route mid-session takes effect immediately, no restart", async (
   assert.equal(agent.config.route, "openai-api");
   assert.equal(agent.config.baseUrl, "https://api.openai.com/v1",
     "and talks to the new endpoint, not the one it started with");
-  agent.close();
+  await agent.close();
 });
 
 test("long menus filter as you type; short ones keep number shortcuts", async () => {

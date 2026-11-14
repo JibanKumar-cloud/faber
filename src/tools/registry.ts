@@ -11,7 +11,9 @@ import type { Config } from "../config.js";
 import { ToolError } from "../errors.js";
 import type { CheckpointManager } from "../checkpoints.js";
 import type { LongTermMemory } from "../memory/longTerm.js";
-import type { CodeIndexer } from "../indexer.js";
+import { AmbiguousSymbolError, SymbolNotFoundError, type Edge } from "../indexer.js";
+import type { GraphIndexer } from "../graph/background.js";
+import { pendingContext, type CurrentGraph, type LiveMethod, type LiveValues } from "../graph/live.js";
 import { FsTools, type PendingWrite } from "./fs.js";
 import { SessionStore } from "../memory/sessions.js";
 import { ShellTool } from "./shell.js";
@@ -38,7 +40,7 @@ export class ToolRegistry {
     private config: Config,
     checkpoints: CheckpointManager,
     private ltm: LongTermMemory,
-    private indexer: CodeIndexer,
+    private indexer: GraphIndexer,
     private approve: ApprovalFn,
     private askUser: AskUserFn = async () => 0,
   ) {
@@ -87,51 +89,91 @@ export class ToolRegistry {
               `User REJECTED running: ${command}. Do not retry the same command; ask the user or take a different approach.`,
             );
           }
-          return this.shell.run(command, i.timeout != null ? (i.timeout as number) * 1000 : undefined, signal);
+          try { return await this.shell.run(command, i.timeout != null ? (i.timeout as number) * 1000 : undefined, signal); }
+          finally { this.indexer.requestCheck?.(); }
         },
       },
       search_code: {
-        description: "Search the symbol index for function/class definitions by name.",
+        description: "Search current definitions by name or qualified name. Returns source locations, analysis provider and IDs for selecting same-named symbols; IDs may change after edits. During background indexing, returns current saved-text hints without symbol bindings.",
         fields: { query: { type: "string", required: true } },
-        handler: (i) => {
-          this.freshIndex();
-          const results = this.indexer.search(i.query as string);
+        handler: async (i, signal) => {
+          const graph = await this.currentGraph("search", [i.query, undefined], signal);
+          if (graph.status !== "ready") return pendingContext(graph);
+          const results = graph.value;
           return results.length
-            ? results.map((r) => `${r.path}:${r.line} [${r.kind}] ${r.signature}`).join("\n")
+            ? results.map((r) => `${r.path}:${r.line} [${r.kind}; ${r.provider}] ${r.signature}\n  ${r.qualified} id=${r.id}`).join("\n")
             : "No symbols matched. Try `grep` for full-text search.";
         },
       },
       who_calls: {
-        description: "Code graph: list every place a function/symbol is called FROM (its blast radius). Edges are static-analysis hints — verify by reading where precision matters.",
+        description: "Code graph: bounded recorded callers of a name or exact symbol ID. Ambiguous names require an ID. Static bindings and heuristic hints are labeled; runtime dispatch and exhaustiveness are not guaranteed.",
         fields: { name: { type: "string", required: true } },
-        handler: (i) => {
-          this.freshIndex();
-          const edges = this.indexer.whoCalls(i.name as string);
+        handler: async (i, signal) => {
+          const graph = await this.currentGraph("whoCalls", [i.name, undefined], signal);
+          if (graph.status !== "ready") return pendingContext(graph);
+          const edges = graph.value;
           return edges.length
-            ? edges.map((e) => `${e.caller} -> ${i.name}  (${e.path}:${e.line})`).join("\n")
+            ? formatGraphEdges(edges)
             : `No recorded callers of ${i.name}. It may be an entry point, called dynamically, or unindexed.`;
         },
       },
+      graph_context: {
+        description: "Find task-relevant current definitions by names, paths and signatures, with bounded resolved static call neighbors. Returns source locations, symbol IDs and labeled analysis providers; during indexing, returns current saved-text hints without call bindings. Token budget is a byte-based estimate; no result proves runtime execution.",
+        fields: { query: { type: "string", required: true }, token_budget: { type: "integer" } },
+        handler: async (i, signal) => {
+          const graph = await this.currentGraph("taskContext", [i.query, { tokenBudget: i.token_budget as number | undefined }], signal);
+          if (graph.status !== "ready") return pendingContext(graph, { tokenBudget: i.token_budget as number | undefined });
+          const result = graph.value;
+          return result.text || "No task-relevant symbols fit this query and budget. Try search_code or grep with a specific identifier or path.";
+        },
+      },
+      graph_changes: {
+        description: "List saved files added, modified or deleted since graph indexing, without running an analyzer. Records include the saved metadata revision and the graph generation that incorporated them. Read pending files directly for current code. Optional include_indexed=1 includes the last incorporated record per file; limit defaults to 100 (max 1000).",
+        fields: { limit: { type: "integer" }, include_indexed: { type: "integer" } },
+        handler: async (i, signal) => {
+          if (i.include_indexed !== undefined && i.include_indexed !== 0 && i.include_indexed !== 1) throw new ToolError("include_indexed must be 0 or 1.");
+          return JSON.stringify(await this.indexer.changes(i.limit as number | undefined,i.include_indexed === 1,signal));
+        },
+      },
+      graph_status: {
+        description: "Report current graph job phase, elapsed time, last published graph coverage and stage timings, last metadata check, and last query's freshness timeout. Does not scan files, start analysis or wait for the worker. A completed job does not prove saved files are still unchanged. If the user requests graph navigation or a retry and analysis is scheduled, call graph_context immediately to bypass the idle delay; do not stop after a status check and tell them to wait. search_code searches definition names, not copied filenames; heuristic IDs are fallback hints, not pending semantic analysis. Avoid sleep-and-search polling.",
+        fields: {},
+        handler: async () => {
+          if (!this.indexer.status) return "Graph timing information is unavailable in this session.";
+          const status = this.indexer.status();
+          return JSON.stringify({...status,readTiming: { latestReadKind: !status.lastRead ? "none" :
+            status.lastRead.method === "prompt" ? "startup_context" : "graph_query",
+            graphQueryRecorded: !!status.lastGraphRead,
+            note: "lastStartupRead measures task startup; lastGraphRead measures an explicit graph request. Scheduled work does not erase lastIndexedUpdate or prove that bindings are unavailable." },
+            nextAction:status.state === "scheduled" || status.state === "pending"
+            ? {tool:"graph_context",reason:"For a requested graph task, call now to bypass the idle fallback; graph_status does not start analysis."}
+            : undefined});
+        },
+      },
       calls_from: {
-        description: "Code graph: list everything a function calls (its dependencies). Static hints — verify by reading where precision matters.",
+        description: "Code graph: bounded call references from a name or exact symbol ID, including unresolved, indirect and contract references. Copy complete IDs from current search_code or graph_context results. For calls inside class methods, query each method's ID; querying the class does not aggregate its methods. Heuristic name matches are not resolved bindings; static bindings do not prove runtime execution or member dispatch.",
         fields: { name: { type: "string", required: true } },
-        handler: (i) => {
-          this.freshIndex();
-          const edges = this.indexer.callsFrom(i.name as string);
+        handler: async (i, signal) => {
+          const graph = await this.currentGraph("referencesFrom", [i.name, undefined], signal);
+          if (graph.status !== "ready") return pendingContext(graph);
+          const edges = graph.value;
           return edges.length
-            ? edges.map((e) => `${i.name} -> ${e.callee}  (${e.path}:${e.line})`).join("\n")
-            : `${i.name} calls no indexed symbols (leaf function, or calls only external/dynamic code).`;
+            ? formatGraphEdges(edges)
+            : `No recorded call references for ${i.name}. This does not prove it is a leaf function; dynamic or unindexed calls may be missing.`;
         },
       },
       trace_path: {
-        description: "Code graph: shortest call chain connecting two symbols, e.g. trace_path(main, saveUser) -> main -> startServer -> handleSignup -> saveUser. Use to understand workflow before editing.",
+        description: "Code graph: bounded shortest static-binding path between names or exact IDs, with a source location per hop. Ambiguous names require an ID. Explicitly ambiguous, unresolved and heuristic references are not traversed. Analyzer-reported calls may include potential dynamic targets. This is not proof of runtime execution or dispatch.",
         fields: { from: { type: "string", required: true }, to: { type: "string", required: true } },
-        handler: (i) => {
-          this.freshIndex();
-          const chain = this.indexer.tracePath(i.from as string, i.to as string);
-          return chain
-            ? chain.join(" -> ")
-            : `No static call path found from ${i.from} to ${i.to} (may be connected dynamically, via events, or not at all).`;
+        handler: async (i, signal) => {
+          const graph = await this.currentGraph("trace", [i.from, i.to, undefined], signal);
+          if (graph.status !== "ready") return pendingContext(graph);
+          const result = graph.value;
+          return result.status === "found"
+            ? [`Static binding path (generation ${result.generation}); runtime execution and member dispatch are not proven.`,
+                ...result.nodes.map(s => `${s.qualified} (${s.path}:${s.line}) id=${s.id}`),
+                ...result.hops.map(formatGraphEdge)].join("\n")
+            : `${result.status}: ${result.reason}\nStatic analysis may omit dynamic or unindexed calls; no result proves runtime execution.`;
         },
       },
       remember: {
@@ -177,12 +219,24 @@ export class ToolRegistry {
         `User REJECTED the change to ${pending.path}. Do not retry the same change; ask the user what they want instead or take a different approach.`,
       );
     }
-    return pending.apply();
+    const result = pending.apply();
+    this.indexer.invalidate?.(pending.path);
+    return result;
   }
 
-  private freshIndex(): void {
-    if (!this.indexer.isBuilt()) this.indexer.build();
-    else this.indexer.refresh(); // incremental: only changed files re-parsed
+  private async currentGraph<M extends Exclude<LiveMethod, "prompt">>(method: M, args: unknown[], signal?: AbortSignal): Promise<CurrentGraph<LiveValues[M]>> {
+    if (this.indexer.current) return this.indexer.current(method, args, signal);
+    // Embedded direct indexers retain their existing explicit fresh-read API.
+    await this.freshIndex(signal);
+    const value = await (this.indexer[method] as (...args: any[]) => unknown).apply(this.indexer, [...args, signal]);
+    return { status: "ready", generation: 0, value: value as LiveValues[M] };
+  }
+
+  private async freshIndex(signal?: AbortSignal): Promise<void> {
+    try {
+      if (!await this.indexer.isBuilt(signal)) await this.indexer.build(signal);
+      else await this.indexer.refresh(signal);
+    } catch (error) { throw new ToolError(`Code graph refresh failed: ${String(error)}`); }
   }
 
   /** Canonical signature used by the agent's doom-loop detector. */
@@ -213,6 +267,7 @@ export class ToolRegistry {
     try {
       return { output: String(await def.handler(input, signal)), isError: false };
     } catch (err) {
+      if (err instanceof AmbiguousSymbolError || err instanceof SymbolNotFoundError) return { output: err.message, isError: true };
       if (err instanceof ToolError) return { output: `Tool error: ${err.message}`, isError: true };
       throw err; // CancelledError and unexpected errors propagate to the agent
     }
@@ -233,4 +288,15 @@ export class ToolRegistry {
       },
     }));
   }
+}
+
+function formatGraphEdges(edges: Edge[]): string {
+  const rows = edges.map(formatGraphEdge);
+  if (edges.some(e => e.status === "heuristic")) rows.unshift(
+    "Includes heuristic name matches; these are not resolved call bindings. Verify targets in source.");
+  return rows.join("\n");
+}
+
+function formatGraphEdge(e: Edge): string {
+  return `${e.caller} -> ${e.callee} (${e.path}:${e.line}${e.callee_path ? ` -> ${e.callee_path}:${e.callee_line}` : ""}) [${e.status}; ${e.dispatch}]${e.callee_id ? ` id=${e.callee_id}` : ""}`;
 }

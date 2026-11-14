@@ -125,7 +125,38 @@ test("e2e: streamed multi-turn task edits a file, verifies, persists session", a
   // undo reverts the created file
   assert.deepEqual(agent.checkpoints.undoLast(), ["hello.txt"]);
   assert.equal(fs.existsSync(path.join(cfg.workspace, "hello.txt")), false);
-  agent.close();
+  await agent.close();
+});
+
+test("e2e: task graph context follows the task and leaves the repository prompt map stable", async t => {
+  const srv = await mockServer([{ text: "Payment checked." }, { text: "Report checked." }]);
+  const cfg = tmpConfig(srv.url), agent = new Agent(cfg, async () => true);
+  t.after(async () => { srv.close(); await agent.close(); fs.rmSync(cfg.workspace, { recursive: true, force: true }); });
+  fs.writeFileSync(path.join(cfg.workspace, "payments.py"), "def process_payment():\n    return 1\n");
+  fs.writeFileSync(path.join(cfg.workspace, "reports.py"), "def generate_report():\n    return 2\n");
+  await agent.indexer.build();
+  let mapCalls = 0;
+  const current = agent.indexer.current.bind(agent.indexer);
+  agent.indexer.current = async (...args) => {
+    const result = await current(...args);
+    if (result.status === "ready" && args[0] === "prompt" && typeof result.value === "object" && "map" in result.value && result.value.map !== undefined) mapCalls++;
+    return result;
+  };
+  await agent.runTask("Check process_payment");
+  await agent.runTask("Check generate_report");
+  const [first, second] = srv.bodies();
+  const context = (body: any) => body.messages.filter((m: any) => m.role === "user").at(-1).content
+    .find((block: any) => block.text?.startsWith("Task-specific code context:"))?.text;
+  assert.match(context(first), /payments.py:1 process_payment/);
+  assert.doesNotMatch(context(first), /generate_report/);
+  assert.match(context(second), /reports.py:1 generate_report/);
+  assert.doesNotMatch(context(second), /process_payment/);
+  assert.doesNotMatch(JSON.stringify(first.system), /Task-specific code context:/);
+  assert.doesNotMatch(JSON.stringify(second.system), /Task-specific code context:/);
+  assert.equal(mapCalls, 1, "the unchanged generation reuses its repository prompt map");
+  const tool = await agent.tools.execute("graph_context", { query: "generate_report", token_budget: 250 });
+  assert.equal(tool.isError, false); assert.match(tool.output, /reports.py:1 generate_report/);
+  assert.ok(Buffer.byteLength(tool.output) <= 750);
 });
 
 test("e2e: doom-loop breaker aborts after 3 identical failing calls", async () => {
@@ -142,7 +173,7 @@ test("e2e: doom-loop breaker aborts after 3 identical failing calls", async () =
   });
   srv.close();
   assert.equal(srv.calls(), 3); // stopped at 3, not maxIterations(10)
-  agent.close();
+  await agent.close();
 });
 
 test("e2e: rejected approval surfaces REJECTED to the model, file untouched", async () => {
@@ -157,7 +188,7 @@ test("e2e: rejected approval surfaces REJECTED to the model, file untouched", as
   srv.close();
   assert.match(answer, /will not make that change/);
   assert.equal(fs.existsSync(path.join(cfg.workspace, "danger.txt")), false);
-  agent.close();
+  await agent.close();
 });
 
 test("e2e: CLI one-shot keeps the FIRST word of the task (regression: wsIdx=-1 bug)", async () => {
@@ -246,7 +277,7 @@ test("e2e steering: typed guidance lands in the NEXT request, roles stay valid",
     for (let i = 1; i < roles.length; i++) assert.notEqual(roles[i], roles[i - 1],
       `roles must alternate, got ${roles.join(",")}`);
   }
-  agent.close();
+  await agent.close();
 });
 
 test("e2e steering: if the model finishes while guidance is queued, the task continues", async () => {
@@ -263,7 +294,7 @@ test("e2e steering: if the model finishes while guidance is queued, the task con
   assert.match(answer, /Handled the extra request/);
   const req2 = JSON.stringify(srv.bodies()[1]);
   assert.match(req2, /also add a license header/);
-  agent.close();
+  await agent.close();
 });
 
 // ═══════════════════════════════════════════════════ cancellation mid-stream
@@ -285,7 +316,7 @@ test("e2e cancel: abort mid-stream raises CancelledError; checkpoints survive fo
   const { CancelledError } = await import("../src/errors.js");
   await assert.rejects(agent.runTask("long task", controller.signal), CancelledError);
   server.close();
-  agent.close();
+  await agent.close();
 });
 
 // ═══════════════════════════════════ token economy: brevity + weak model
@@ -307,7 +338,7 @@ test("e2e: brevity block in system prompt by default; removed in /verbose; code-
   assert.match(sys1, /NO emojis unless the user uses them first/);
   assert.match(sys1, /Never truncate, elide, or simplify CODE/);
   assert.doesNotMatch(sys2, /Output discipline/);             // verbose removes it
-  agent.close();
+  await agent.close();
 });
 
 test("e2e: internal summarization routes to CW_WEAK_MODEL", async () => {
@@ -318,5 +349,5 @@ test("e2e: internal summarization routes to CW_WEAK_MODEL", async () => {
   await agent.llm.summarize("long transcript here", "summarize");
   srv.close();
   assert.equal(srv.bodies()[0].model, "cheap-model-x");       // not the main model
-  agent.close();
+  await agent.close();
 });

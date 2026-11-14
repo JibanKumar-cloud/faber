@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { createRequire } from "node:module";
 
 import { LongTermMemory } from "../src/memory/longTerm.js";
 import { ShortTermMemory, SUMMARY_MARKER } from "../src/memory/shortTerm.js";
@@ -155,7 +156,7 @@ test("registry: validates input, rejection message on denied approval", async ()
   const cfg = tmpConfig();
   const cp = new CheckpointManager(cfg.stateDir, cfg.workspace);
   const ltm = new LongTermMemory(cfg.memoryDb);
-  const idx = new CodeIndexer(cfg.indexDb, cfg.workspace);
+  const idx = new CodeIndexer(cfg.indexDb, cfg.workspace, { providers: false });
   const denyAll = async () => false;
   const reg = new ToolRegistry(cfg, cp, ltm, idx, denyAll);
   cp.begin();
@@ -175,12 +176,12 @@ test("registry: validates input, rejection message on denied approval", async ()
 });
 
 // ---------------------------------------------------------------- indexer
-test("indexer: finds symbols across languages", () => {
+test("indexer: finds symbols across languages", async () => {
   const cfg = tmpConfig();
   fs.writeFileSync(path.join(cfg.workspace, "m.py"), "class Foo:\n    def bar(self):\n        pass\n");
   fs.writeFileSync(path.join(cfg.workspace, "m.ts"), "export function baz() {}\ninterface Qux {}\n");
-  const idx = new CodeIndexer(cfg.indexDb, cfg.workspace);
-  const stats = idx.build();
+  const idx = new CodeIndexer(cfg.indexDb, cfg.workspace, { providers: false });
+  const stats = await idx.build();
   assert.ok(stats.symbols >= 4);
   assert.ok(idx.search("Foo").some((r) => r.kind === "class"));
   assert.ok(idx.search("baz").some((r) => r.path === "m.ts"));
@@ -275,7 +276,7 @@ test("registry: run_shell gated by approval; denial tells model not to retry", a
   const cfg = tmpConfig();
   const cp = new CheckpointManager(cfg.stateDir, cfg.workspace);
   const ltm = new LongTermMemory(cfg.memoryDb);
-  const idx = new CodeIndexer(cfg.indexDb, cfg.workspace);
+  const idx = new CodeIndexer(cfg.indexDb, cfg.workspace, { providers: false });
   const seen: string[] = [];
   const reg = new ToolRegistry(cfg, cp, ltm, idx, async (p) => {
     seen.push(`${p.kind}:${p.path}`);
@@ -308,7 +309,7 @@ test("ask_user: choice returned to model; escape option means discuss", async ()
   const cfg = tmpConfig();
   const cp = new CheckpointManager(cfg.stateDir, cfg.workspace);
   const ltm = new LongTermMemory(cfg.memoryDb);
-  const idx = new CodeIndexer(cfg.indexDb, cfg.workspace);
+  const idx = new CodeIndexer(cfg.indexDb, cfg.workspace, { providers: false });
   let presented: string[] = [];
   let answer = 1;
   const reg = new ToolRegistry(cfg, cp, ltm, idx, async () => true, async (_q, opts) => {
@@ -330,53 +331,53 @@ test("ask_user: choice returned to model; escape option means discuss", async ()
 });
 
 // ------------------------------------------------------------- code graph
-test("graph: call edges across files, who_calls, trace_path", () => {
+test("graph: call edges across files, who_calls, trace_path", async () => {
   const cfg = tmpConfig();
   fs.writeFileSync(path.join(cfg.workspace, "a.py"),
     "def main():\n    start_server()\n\ndef start_server():\n    handle_signup()\n");
   fs.writeFileSync(path.join(cfg.workspace, "b.py"),
     "def handle_signup():\n    save_user()\n\ndef save_user():\n    pass\n");
-  const idx = new CodeIndexer(cfg.indexDb, cfg.workspace);
-  const stats = idx.build();
+  const idx = new CodeIndexer(cfg.indexDb, cfg.workspace, { providers: false });
+  const stats = await idx.build();
   assert.ok(stats.edges >= 3, `edges=${stats.edges}`);
   // backward: who calls save_user? handle_signup (in b.py)
   const callers = idx.whoCalls("save_user");
   assert.ok(callers.some((e) => e.caller === "handle_signup"));
-  // forward chain across files
+  // Heuristic hints remain visible but cannot be composed into a claimed path.
   const chain = idx.tracePath("main", "save_user");
-  assert.deepEqual(chain, ["main", "start_server", "handle_signup", "save_user"]);
-  // call tree renders
-  assert.match(idx.callTree("main"), /save_user/);
+  assert.equal(chain, undefined);
+  assert.equal(idx.trace("main", "save_user").status, "unavailable");
+  assert.match(idx.callTree("main"), /unavailable.*Heuristic/);
   // repo map surfaces connected symbols
   assert.match(idx.repoMap(), /handle_signup|save_user/);
   idx.close();
 });
 
-test("graph: incremental refresh picks up new function + edge, prunes deleted file", () => {
+test("graph: incremental refresh picks up new function + edge, prunes deleted file", async () => {
   const cfg = tmpConfig();
   const a = path.join(cfg.workspace, "a.py");
   fs.writeFileSync(a, "def alpha():\n    pass\n");
   const b = path.join(cfg.workspace, "b.py");
   fs.writeFileSync(b, "def beta():\n    pass\n");
-  const idx = new CodeIndexer(cfg.indexDb, cfg.workspace);
-  idx.build();
+  const idx = new CodeIndexer(cfg.indexDb, cfg.workspace, { providers: false });
+  await idx.build();
   assert.equal(idx.whoCalls("alpha").length, 0);
   // simulate developer adding a new function that calls alpha (bump mtime)
   fs.writeFileSync(b, "def beta():\n    alpha()\n\ndef gamma():\n    beta()\n");
   fs.utimesSync(b, new Date(), new Date(Date.now() + 5000));
-  const stats = idx.refresh();
+  const stats = await idx.refresh();
   assert.equal(stats.files, 1);                             // only b.py re-parsed
   assert.ok(idx.whoCalls("alpha").some((e) => e.caller === "beta"));
   assert.ok(idx.search("gamma").length === 1);              // new node present
   // deleting a file prunes its rows
   fs.unlinkSync(b);
-  idx.refresh();
+  await idx.refresh();
   assert.equal(idx.search("gamma").length, 0);
   assert.equal(idx.whoCalls("alpha").length, 0);
   idx.close();
 });
 
-test("usage: agent accumulates token usage across loop iterations", async () => {
+test("usage: agent accumulates token usage across loop iterations", () => {
   // covered end-to-end in e2e.test.ts (mock server emits usage); here we
   // sanity-check the Usage math the CLI footer relies on.
   const u = { input: 1000, cacheRead: 9000, cacheWrite: 500, output: 300 };
@@ -386,12 +387,12 @@ test("usage: agent accumulates token usage across loop iterations", async () => 
 });
 
 // ═══════════════════════════════════════════════ graph edge cases (cycles etc)
-test("graph: cyclic call graphs terminate — tracePath and callTree are cycle-safe", () => {
+test("graph: cyclic call graphs terminate — tracePath and callTree are cycle-safe", async () => {
   const cfg = tmpConfig();
-  fs.writeFileSync(path.join(cfg.workspace, "cyc.py"),
-    "def ping():\n    pong()\n\ndef pong():\n    ping()\n    done()\n\ndef done():\n    pass\n");
-  const idx = new CodeIndexer(cfg.indexDb, cfg.workspace);
-  idx.build();
+  fs.writeFileSync(path.join(cfg.workspace, "cyc.ts"),
+    "export function ping() { pong(); }\nfunction pong() { ping(); done(); }\nfunction done() {}\n");
+  const idx = new CodeIndexer(cfg.indexDb, cfg.workspace, { providers: false, typescript: createRequire(import.meta.url).resolve("typescript") });
+  await idx.build();
   // path THROUGH a cycle still resolves
   assert.deepEqual(idx.tracePath("ping", "done"), ["ping", "pong", "done"]);
   // unreachable target returns undefined instead of hanging
@@ -403,14 +404,14 @@ test("graph: cyclic call graphs terminate — tracePath and callTree are cycle-s
   idx.close();
 });
 
-test("graph: keywords never become edges; module-level calls attribute to <module>", () => {
+test("graph: keywords never become edges; module-level calls attribute to <module>", async () => {
   const cfg = tmpConfig();
   fs.writeFileSync(path.join(cfg.workspace, "kw.py"),
     "def helper():\n    pass\n");
   fs.writeFileSync(path.join(cfg.workspace, "top.py"),
     "import kw\nhelper()\nif (True):\n    while (x):\n        helper()\n");
-  const idx = new CodeIndexer(cfg.indexDb, cfg.workspace);
-  idx.build();
+  const idx = new CodeIndexer(cfg.indexDb, cfg.workspace, { providers: false });
+  await idx.build();
   const callers = idx.whoCalls("helper").map((e) => e.caller);
   assert.ok(callers.includes("<module>"));
   assert.equal(idx.whoCalls("if").length + idx.whoCalls("while").length, 0);
@@ -471,4 +472,58 @@ test("git: previously-committed state dir triggers TRACKED warning", () => {
   // "pathspec 'committed' did not match any file(s)".
   run('git add -A && git commit -qm "accidentally committed state"');
   assert.equal(ensureStateIgnored(cfg.workspace), "TRACKED");
+});
+
+// Agent-facing output must carry IDs, locations and uncertainty through the tool boundary.
+test("graph tools: invalid IDs are actionable and Python fallback calls explicitly remain heuristic", async t => {
+  const cfg = tmpConfig();
+  t.after(() => fs.rmSync(cfg.workspace, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(cfg.workspace, "pipeline.py"), "class Pipeline:\n    def run(self):\n        helper()\ndef helper():\n    pass\n");
+  const idx = new CodeIndexer(cfg.indexDb, cfg.workspace, { providers: false, typescript: false });
+  const ltm = new LongTermMemory(cfg.memoryDb);
+  const reg = new ToolRegistry(cfg, new CheckpointManager(cfg.stateDir, cfg.workspace), ltm, idx, async () => false);
+  try {
+    const search = await reg.execute("search_code", { query: "Pipeline" });
+    const id = /id=(\S+)/.exec(search.output)?.[1];
+    assert.ok(id);
+    const incomplete = id.replace(/@\d+$/, "");
+    for (const [tool, input] of [
+      ["calls_from", { name: incomplete }], ["who_calls", { name: incomplete }],
+      ["trace_path", { from: incomplete, to: "helper" }],
+    ] as const) {
+      const result = await reg.execute(tool, input);
+      assert.equal(result.isError, true);
+      assert.match(result.output, /Symbol ID .* is not present in the current graph/);
+      assert.match(result.output, /Copy a complete current id from search_code or graph_context/);
+      assert.doesNotMatch(result.output, /No recorded|graph pending/);
+    }
+    const empty = await reg.execute("calls_from", { name: id });
+    assert.equal(empty.isError, false);
+    assert.match(empty.output, /No recorded call references/);
+    for (const [tool, name] of [["calls_from", "run"], ["who_calls", "helper"]]) {
+      const result = await reg.execute(tool!, { name });
+      assert.equal(result.isError, false);
+      assert.match(result.output, /Includes heuristic name matches; these are not resolved call bindings/);
+      assert.match(result.output, /run -> helper.*\[heuristic; unknown\]/);
+    }
+  } finally { idx.close(); ltm.close(); }
+});
+
+test("graph tools: ambiguity is actionable, traced hops have locations, indirect calls are explicit", async (t) => {
+  const cfg=tmpConfig();
+  t.after(()=>fs.rmSync(cfg.workspace,{recursive:true,force:true}));
+  fs.mkdirSync(path.join(cfg.workspace,"a"));fs.mkdirSync(path.join(cfg.workspace,"b"));
+  fs.writeFileSync(path.join(cfg.workspace,"a/parser.ts"),"export function parse() { validate(); } function validate() {}\n");
+  fs.writeFileSync(path.join(cfg.workspace,"b/config.ts"),"export function parse() { freeze(); } function freeze() {}\n");
+  fs.writeFileSync(path.join(cfg.workspace,"main.ts"),'import {parse} from "./a/parser.js"; export function entry() { parse(); }\nexport function invoke(cb:()=>void) { cb(); }\n');
+  const idx=new CodeIndexer(cfg.indexDb,cfg.workspace,{providers:false,typescript:createRequire(import.meta.url).resolve("typescript")});
+  const ltm=new LongTermMemory(cfg.memoryDb);
+  const reg=new ToolRegistry(cfg,new CheckpointManager(cfg.stateDir,cfg.workspace),ltm,idx,async()=>false);
+  try {
+    const search=await reg.execute("search_code",{query:"parse"});assert.equal(search.isError,false);assert.match(search.output,/id=ts:/);
+    const ambiguity=await reg.execute("calls_from",{name:"parse"});assert.equal(ambiguity.isError,true);assert.match(ambiguity.output,/Ambiguous symbol/);assert.match(ambiguity.output,/a[/\\]parser.ts/);
+    const falsePath=await reg.execute("trace_path",{from:"entry",to:"freeze"});assert.match(falsePath.output,/not_found/);
+    const truePath=await reg.execute("trace_path",{from:"entry",to:"validate"});assert.match(truePath.output,/Static binding path/);assert.match(truePath.output,/main.ts:1/);assert.match(truePath.output,/a[/\\]parser.ts:1/);assert.match(truePath.output,/runtime execution.*not proven/);
+    const callback=await reg.execute("calls_from",{name:"invoke"});assert.match(callback.output,/indirect; callback/);
+  } finally {idx.close();ltm.close();}
 });

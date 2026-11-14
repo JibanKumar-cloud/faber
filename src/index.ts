@@ -267,13 +267,15 @@ async function main(): Promise<void> {
       case "/exit": case "/quit": return false;
       case "/help": console.log(HELP); break;
       case "/index": {
-        const s = agent.indexer.build();
-        console.log(`Indexed ${s.files} files, ${s.symbols} symbols, ${s.edges} call edges.`); break;
+        const s = await agent.indexer.build();
+        console.log(`Indexed ${s.files} files, ${s.symbols} symbols, ${s.edges} call edges.`);
+        console.log(await agent.indexer.coverage()); break;
       }
       case "/map": {
         if (!args[0]) { console.log("Usage: /map <function-or-symbol>   e.g. /map main"); break; }
-        if (!agent.indexer.isBuilt()) agent.indexer.build(); else agent.indexer.refresh();
-        console.log(agent.indexer.callTree(args[0]));
+        const graph = await agent.indexer.current("callTree", [args[0]]);
+        console.log(graph.status === "ready" ? graph.value :
+          `Code graph ${graph.status}: ${graph.reason} Use /index to explicitly wait for a complete graph.`);
         break;
       }
       case "/memory": {
@@ -572,7 +574,7 @@ async function main(): Promise<void> {
     }
   } finally {
     rl.close();
-    agent.close();
+    await agent.close();
     console.log(pc.dim("bye."));
   }
 }
