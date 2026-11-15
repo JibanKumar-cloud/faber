@@ -1,7 +1,7 @@
 {
   "name": "faberwright",
   "version": "0.4.4",
-  "description": "Faber: an agentic AI coding assistant for your terminal — streams, edits with diff approval, runs your tests, and remembers your project across sessions.",
+  "description": "Faber: an agentic AI coding assistant for your terminal \u2014 streams, edits with diff approval, runs your tests, and remembers your project across sessions.",
   "type": "module",
   "license": "Apache-2.0",
   "engines": {
@@ -17,15 +17,17 @@
     "LICENSE"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.build.json",
-    "test": "tsc && node --test dist-test/test/*.test.js",
+    "build": "node -e \"for (const d of ['dist']) require('node:fs').rmSync(d,{recursive:true,force:true})\" && tsc -p tsconfig.build.json",
+    "test": "node -e \"for (const d of ['dist-test']) require('node:fs').rmSync(d,{recursive:true,force:true})\" && tsc && node --test dist-test/test/*.test.js",
     "prepublishOnly": "npm test && npm run build",
     "dev": "tsc -p tsconfig.build.json --watch",
     "postbuild": "chmod +x dist/index.js"
   },
   "dependencies": {
+    "@repomix/tree-sitter-wasms": "^0.1.17",
     "diff": "^7.0.0",
-    "picocolors": "^1.1.0"
+    "picocolors": "^1.1.0",
+    "web-tree-sitter": "^0.27.2"
   },
   "devDependencies": {
     "@types/diff": "^6.0.0",

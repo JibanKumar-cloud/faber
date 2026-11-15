@@ -269,13 +269,13 @@ async function main(): Promise<void> {
       case "/index": {
         const s = await agent.indexer.build();
         console.log(`Indexed ${s.files} files, ${s.symbols} symbols, ${s.edges} call edges.`);
-        console.log(await agent.indexer.coverage()); break;
+        console.log(agent.indexer.coverage()); break;
       }
       case "/map": {
         if (!args[0]) { console.log("Usage: /map <function-or-symbol>   e.g. /map main"); break; }
-        const graph = await agent.indexer.current("callTree", [args[0]]);
-        console.log(graph.status === "ready" ? graph.value :
-          `Code graph ${graph.status}: ${graph.reason} Use /index to explicitly wait for a complete graph.`);
+        await agent.indexer.refresh();
+        // An ambiguous or unknown name is answered with the matching IDs to choose from.
+        try { console.log(agent.indexer.callTree(args[0])); } catch (error) { console.log((error as Error).message); }
         break;
       }
       case "/memory": {
@@ -533,10 +533,12 @@ async function main(): Promise<void> {
       `  route: ${getRoute(config.route)?.label ?? config.route}` +
       (config.profileName !== "default" ? `  profile: ${config.profileName}` : "") +
       `  approval: ${approvalMode}`));
+    // Ignore Faber's own state directory first, or a clean clone looks dirty because of it.
+    const stateIgnore = ensureStateIgnored(config.workspace);
     if (isRepo(config.workspace) && isDirty(config.workspace)) {
       console.log(pc.yellow("Git: you have uncommitted changes — consider committing before letting me edit."));
     }
-    switch (ensureStateIgnored(config.workspace)) {
+    switch (stateIgnore) {
       case "excluded-now":
         console.log(pc.dim(`Protected ${path.basename(config.stateDir)}/ from commits via .git/info/exclude (local). Add it to .gitignore too if teammates will use Faber.`));
         break;

@@ -1,1157 +1,698 @@
 /**
- * Incremental code graph with qualified, source-grounded symbol identities.
+ * Code graph: one SQLite database, one engine for every language.
  *
- * Nodes:  symbols (functions, classes, ...) as before.
- * Edges:  calls   (enclosing function -> called name, resolved against the
- *                  symbol table) and imports (file -> file/module).
- * Incremental: refresh() checks saved-file metadata and parses only changed
- * files. Cached call references let definition additions/removals update
- * unchanged callers too. The CLI coalesces saved-file updates in its worker;
- * unsaved editor buffers are outside this index. Current reads verify freshness
- * without waiting for an analyzer or exposing stale call bindings.
+ *   extract.ts    file  → definitions, call sites, imports   (tree-sitter or the generic scanner)
+ *   resolve.ts    call  → the definition it means, or its candidates when the code is ambiguous
+ *   indexer.ts    store, incremental refresh, queries        (this file)
  *
- * Local language servers provide source-located static call hierarchies through
- * one shared adapter. A project TypeScript compiler remains a fallback. Providers
- * are optional and never installed automatically. Missing analysis retains labeled
- * heuristic hints, which are never composed into paths. Static calls do not prove
- * runtime dispatch. Complete native inventories select dependency components;
- * unavailable or incomplete inventories retain broad provider refresh.
+ * Symbols have readable, stable IDs: `path#Qualified.name`. Two functions with
+ * the same name are two symbols; a call links to one of them only when scope,
+ * imports or types say which. See docs/code-graph.md.
+ *
+ * refresh() compares file mtime/size, re-parses only changed files and
+ * re-resolves only the calls those changes can affect. The result always
+ * equals a clean build of the same files (asserted in test/graph.test.ts).
+ * Static analysis is navigation help, not proof: dynamic dispatch, reflection
+ * and generated code are invisible to it.
  */
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { createRequire } from "node:module";
-import { createHash } from "node:crypto";
-import type * as TS from "typescript";
-import { discoverProviders, LANGUAGE_SERVERS, type LspProviderConfig } from "./graph/providers.js";
-import { LspGraph, type ProviderFacts } from "./graph/lsp.js";
-import { AnalyzerCacheStore, factHash, type CacheContext, type DependencyProgress } from "./graph/cache.js";
-import { canonicalPath, dependencyInputStamp } from "./graph/dependencies.js";
-import { TaskContextIndex, type ContextOptions, type TaskContext } from "./graph/context.js";
-import { ChangeJournal, type ChangeList, type FileChange } from "./graph/changes.js";
-export type { ChangeList, FileChange } from "./graph/changes.js";
-import { GRAPH_SKIP_DIRS, environmentKey, AnalysisTimer, type AnalysisProgress, type CurrentGraph, type LiveMethod, type LiveValues } from "./graph/live.js";
-export type { ContextOptions, TaskContext } from "./graph/context.js";
+import { extractFile, grammarProblems, CLASS_KINDS, type FileFacts } from "./graph/extract.js";
+import { languageFor, type Import, type ModuleIndex } from "./graph/languages.js";
+import { EXPORT_HOPS, REACH_HOPS, Resolver, type GraphSource, type Resolution, type Status, type Sym } from "./graph/resolve.js";
+export type { Sym as Symbol, Status } from "./graph/resolve.js";
 
-const SKIP_DIRS = GRAPH_SKIP_DIRS;
-
-type Pattern = [kind: string, regex: RegExp];
-const JS_ARROW = /(?:const|let|var)\s+(\w+)\s*=\s*(?:async\s*)?\([^;]*?\)\s*(?::[^=;]+?)?\s*=>/;
-// Modifiers distinguish methods from calls; a generator's star needs no space.
-const JS_METHOD = /^\s{2,}(?:(?:(?:public|private|protected|static|readonly|abstract|override|async|get|set)\s+)+(?:\*\s*)?|\*\s*)(\w+)\s*(?:<[^>]*>)?\s*\(/;
-const LANG: Record<string, Pattern[]> = {
-  ".py": [["function", /^\s*(?:async\s+)?def\s+(\w+)/], ["class", /^\s*class\s+(\w+)/]],
-  ".js": [["function", /function\s+(\w+)/], ["class", /class\s+(\w+)/],
-          ["function", JS_ARROW], ["method", JS_METHOD]],
-  ".ts": [["function", /function\s+(\w+)/], ["class", /class\s+(\w+)/],
-          ["interface", /interface\s+(\w+)/], ["type", /^\s*type\s+(\w+)\s*=/],
-          ["function", JS_ARROW], ["method", JS_METHOD]],
-  ".go": [["function", /func\s+(?:\([^)]*\)\s*)?(\w+)/], ["type", /type\s+(\w+)/]],
-  ".rs": [["function", /fn\s+(\w+)/], ["struct", /struct\s+(\w+)/],
-          ["enum", /enum\s+(\w+)/], ["trait", /trait\s+(\w+)/]],
-  ".java": [["class", /class\s+(\w+)/], ["interface", /interface\s+(\w+)/],
-            ["method", /(?:public|private|protected)\s+[\w<>[\]]+\s+(\w+)\s*\(/]],
-  ".c": [["function", /^[\w*]+\s+(\w+)\s*\([^;]*\)\s*\{/]],
-  ".cpp": [["function", /^[\w*:<>]+\s+(\w+)\s*\([^;]*\)\s*\{/], ["class", /class\s+(\w+)/]],
-  ".rb": [["function", /^\s*def\s+(\w+)/], ["class", /^\s*class\s+(\w+)/], ["module", /^\s*module\s+(\w+)/]],
-  ".php": [["function", /function\s+(\w+)/], ["class", /class\s+(\w+)/]],
-};
-LANG[".jsx"] = LANG[".js"]!; LANG[".tsx"] = LANG[".ts"]!;
-LANG[".mjs"] = LANG[".js"]!; LANG[".cjs"] = LANG[".js"]!;
-LANG[".mts"] = LANG[".ts"]!; LANG[".cts"] = LANG[".ts"]!;
-LANG[".h"] = LANG[".c"]!; LANG[".hpp"] = LANG[".cpp"]!;
-
-const IMPORT_RX: Record<string, RegExp[]> = {
-  ".py": [/^\s*from\s+([\w.]+)\s+import/, /^\s*import\s+([\w.]+)/],
-  ".js": [/from\s+["']([^"']+)["']/, /require\(\s*["']([^"']+)["']\s*\)/],
-  ".go": [/^\s*"([\w./-]+)"/],
-  ".rs": [/^\s*use\s+([\w:]+)/],
-  ".java": [/^\s*import\s+([\w.]+)/],
-  ".rb": [/^\s*require(?:_relative)?\s+["']([^"']+)["']/],
-  ".php": [/^\s*use\s+([\w\\]+)/],
-};
-IMPORT_RX[".ts"] = IMPORT_RX[".js"]!; IMPORT_RX[".jsx"] = IMPORT_RX[".js"]!;
-IMPORT_RX[".tsx"] = IMPORT_RX[".js"]!; IMPORT_RX[".mjs"] = IMPORT_RX[".js"]!;
-
-// identifiers that look like calls but aren't
-const CALL_KEYWORDS = new Set([
-  "if", "for", "while", "switch", "catch", "return", "function", "typeof",
-  "super", "constructor", "def", "class", "print", "await", "async", "new",
-  "assert", "yield", "match", "case", "elif", "except", "raise", "sizeof",
-  "extends", "implements",
+const SCHEMA_VERSION = 23;
+const SKIP_DIRS = new Set([
+  ".git", ".faber", ".codewright", "node_modules", ".venv", "venv", "__pycache__", "dist", "build",
+  ".mypy_cache", ".pytest_cache", "target", ".next", "dist-test", "vendor", "Pods", ".gradle", "coverage",
 ]);
-// Python hard keywords cannot be callees. Keep this language-specific: names
-// such as `or`, `and`, and `not` are valid identifiers in other languages.
-const PYTHON_KEYWORDS = new Set([
-  "False", "None", "True", "and", "as", "assert", "async", "await", "break",
-  "class", "continue", "def", "del", "elif", "else", "except", "finally",
-  "for", "from", "global", "if", "import", "in", "is", "lambda", "nonlocal",
-  "not", "or", "pass", "raise", "return", "try", "while", "with", "yield",
-]);
-export function isLanguageKeyword(name: string, ext: string): boolean {
-  return (ext === ".py" || ext === ".pyi") && PYTHON_KEYWORDS.has(name);
-}
-const CALL_RX = /(\w+)\s*\(/g;
-// Invalidate cached facts once so old Python keyword references are removed.
-const PARSER_VERSION = "7";
-const JS_EXTENSIONS = new Set([".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs"]);
+const MAX_FILE_BYTES = 1_000_000;
+/** Files parsed per transaction during a large build. */
+const BATCH = 400;
 
-interface FileStamp { mtime_ms: number; ctime_ms: number | null; size: number | null; }
-const sameStamp = (a: FileStamp, b: FileStamp) => a.mtime_ms === b.mtime_ms && a.ctime_ms === b.ctime_ms && a.size === b.size;
-const stampRevision = (s: FileStamp) => `${s.mtime_ms}:${s.ctime_ms}:${s.size}`;
-
-export interface Symbol {
-  name: string; kind: string; path: string; line: number; signature: string;
-  id: string; qualified: string; end_line: number; column: number; provider: string;
-}
-export interface Edge {
-  caller: string; callee: string; path: string; line: number;
-  caller_id: string; callee_id: string | null; callee_path: string | null;
-  callee_line: number | null; status: string; dispatch: string;
-}
-export interface Reference {
-  caller: string; callee: string; path: string; line: number; id: string;
-  caller_id: string; target_id: string | null; status: string; dispatch: string; position: number;
-}
-export interface FileFacts { symbols: Symbol[]; refs: Reference[]; imports: { target: string; line: number }[]; }
+export interface IndexStats { files: number; symbols: number; edges: number; }
 export interface IndexerOptions {
-  /** Optional local language servers; false disables discovery. No auto-installation. */
-  providers?: LspProviderConfig[] | false;
-  /** Optional project compiler module path, or false to retain heuristic mode. */
-  typescript?: string | false;
-  /** Source-file guard, not a heap guarantee. Large compiler programs are expensive. */
-  semanticFileLimit?: number;
+  /** Upper bound on indexed source files (default 20,000 or FABER_GRAPH_MAX_FILES). */
+  maxFiles?: number;
+  onProgress?: (done: number, total: number) => void;
 }
-export interface TraceResult {
-  status: "found" | "not_found" | "incomplete" | "unavailable";
-  nodes: Symbol[]; hops: Edge[]; generation: number; reason?: string;
+/** One call site, joined with both of its ends. */
+export interface Edge {
+  path: string; line: number; name: string; recv: string; status: Status; via: string;
+  caller_id: string; callee_id: string | null;
+  /** Candidate definitions when status is "ambiguous" (at most 8). */
+  candidates: string[]; candidate_count: number;
 }
+export interface TraceResult { status: "found" | "not_found" | "incomplete"; nodes: Sym[]; hops: Edge[]; reason?: string; }
 export class AmbiguousSymbolError extends Error {}
 export class SymbolNotFoundError extends Error {}
-export interface GraphWatchInventory {
-  directories: Set<string>; extensions: Set<string>; inputs: Set<string>; inputDirectories: Set<string>;
+
+interface CallRow { id: number; path: string; caller_id: string; name: string; recv: string; is_new: number; line: number;
+  status: Status; via: string; target_id: string | null; candidates: number; }
+
+interface OldDef { name: string; kind: string; qualified: string; container: string; top: number; }
+
+const posix = (p: string) => p.split(path.sep).join("/");
+/** `a.b.c` → `c`; receivers that name nothing ("", "?", "self") → "". */
+const lastSegment = (recv: string) => recv === "?" || recv === "self" ? "" : recv.slice(recv.lastIndexOf(".") + 1);
+const dirOf = (file: string) => file.includes("/") ? file.slice(0, file.lastIndexOf("/")) : "";
+const bounded = (value: number | undefined, fallback: number, max: number) =>
+  value == null || !Number.isFinite(value) ? fallback : Math.max(0, Math.min(max, Math.floor(value)));
+const escapeLike = (s: string) => s.replace(/[\\%_]/g, "\\$&");
+const EDGE = "status IN ('resolved','inferred')";
+/** Paths that are test code: listed after everything else, and ranked lower in task context. */
+const TEST_PATH = /(?:^|[/_.-])(?:tests?|fixtures|spec|__tests__)(?:[/_.-]|$)/i;
+/** Matches the partial index on calls(caller_id); keep the text identical. */
+const LINKED = "status IN ('resolved','inferred','ambiguous')";
+
+/** Split identifiers into searchable words: parseConfig → "parseconfig parse config". */
+export function searchTerms(text: string): string[] {
+  const split = text.replace(/([\p{Ll}\d])(\p{Lu})/gu, "$1 $2").replace(/(\p{Lu})(\p{Lu}\p{Ll})/gu, "$1 $2");
+  return [...new Set([...(text.match(/[\p{L}\p{N}_$]+/gu) ?? []), ...(split.match(/[\p{L}\p{N}]+/gu) ?? [])].map(s => s.toLowerCase()))];
 }
+const STOP_WORDS = new Set(("a an and are as at be by can change code could do file files fix for from function functions how i " +
+  "implement in into is it me method methods of on or please should that the this to update use want we what with would you").split(" "));
 
 export class CodeIndexer {
   private db: DatabaseSync;
-  private compiler?: TypeScriptGraph;
-  private compilerKey = "";
-  private languages?: LspGraph;
-  private languagesKey = "";
-  private updating?: Promise<{ files: number; symbols: number; edges: number }>;
+  private workspace: string;
+  private running?: Promise<IndexStats>;
   private closed = false;
-  private taskIndex: TaskContextIndex;
-  private promptMap?: { generation: number; text: string };
-  private journal: ChangeJournal;
-  private journalExtensions: Set<string>;
-  private cacheStore: AnalyzerCacheStore;
-  private cacheInventory?: ReturnType<CodeIndexer["inspect"]>;
-  private cacheKey?: string;
-  private fileStampsCache?: { generation: string | undefined; files: Map<string, FileStamp> };
+  private fts = true;
+  private skipped = 0;
+  /** What the most recent update that found changes had to do: files parsed and call sites re-resolved. */
+  lastUpdate = { files: 0, calls: 0, full: false };
 
-  constructor(dbPath: string, private workspace: string, private options: IndexerOptions = {},
-    private checkCancelled: () => void = () => {}, private observeInventory?: (inventory: GraphWatchInventory) => void,
-    private observeProgress?: (progress: AnalysisProgress) => void, private observeDependency?: (progress: DependencyProgress) => void) {
-    // Child analyzers may report real paths even when the CLI entered through
-    // a directory alias (for example /var versus /private/var on macOS).
-    this.workspace = canonicalPath(workspace);
+  constructor(dbPath: string, workspace: string, private options: IndexerOptions = {}) {
+    // Resolve symlinked workspaces (/var vs /private/var on macOS) once, so paths are stable.
+    try { this.workspace = fs.realpathSync(workspace); } catch { this.workspace = path.resolve(workspace); }
     this.db = new DatabaseSync(dbPath);
-    this.db.exec("PRAGMA journal_mode = WAL");
-    this.db.exec("CREATE TABLE IF NOT EXISTS symbols (name TEXT, kind TEXT, path TEXT, line INTEGER, signature TEXT)");
-    this.db.exec("CREATE INDEX IF NOT EXISTS idx_name ON symbols(name)");
-    this.db.exec("CREATE INDEX IF NOT EXISTS idx_symbols_path ON symbols(path)");
-    this.db.exec("CREATE TABLE IF NOT EXISTS edges (caller TEXT, callee TEXT, path TEXT, line INTEGER)");
-    this.db.exec("CREATE INDEX IF NOT EXISTS idx_callee ON edges(callee)");
-    this.db.exec("CREATE INDEX IF NOT EXISTS idx_caller ON edges(caller)");
-    this.db.exec("CREATE INDEX IF NOT EXISTS idx_edges_path ON edges(path)");
-    this.db.exec("CREATE TABLE IF NOT EXISTS imports (src TEXT, target TEXT, line INTEGER)");
-    this.db.exec("CREATE INDEX IF NOT EXISTS idx_imports_src ON imports(src)");
-    // Keep unresolved references as well as resolved edges, including across restarts.
-    this.db.exec("CREATE TABLE IF NOT EXISTS call_refs (caller TEXT, callee TEXT, path TEXT, line INTEGER)");
-    this.db.exec("CREATE INDEX IF NOT EXISTS idx_call_refs_path ON call_refs(path)");
-    this.db.exec("CREATE INDEX IF NOT EXISTS idx_call_refs_callee ON call_refs(callee)");
-    this.db.exec("CREATE TABLE IF NOT EXISTS files (path TEXT PRIMARY KEY, mtime_ms REAL)");
-    // Add cache metadata in place; old caches are reparsed once below.
-    const fileColumns = new Set(this.db.prepare("PRAGMA table_info(files)").all().map(r => r.name));
-    if (!fileColumns.has("ctime_ms")) this.db.exec("ALTER TABLE files ADD COLUMN ctime_ms REAL");
-    if (!fileColumns.has("size")) this.db.exec("ALTER TABLE files ADD COLUMN size INTEGER");
-    this.db.exec("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)");
-    this.cacheStore = new AnalyzerCacheStore(this.db);
-    // Additive cache migration: retain existing graph tables and lookup indexes.
-    for (const [table, columns] of Object.entries({
-      symbols: { id: "TEXT", qualified: "TEXT", end_line: "INTEGER", column: "INTEGER", provider: "TEXT" },
-      edges: { caller_id: "TEXT", callee_id: "TEXT", callee_path: "TEXT", callee_line: "INTEGER", status: "TEXT", dispatch: "TEXT" },
-      call_refs: { id: "TEXT", caller_id: "TEXT", target_id: "TEXT", status: "TEXT", dispatch: "TEXT", position: "INTEGER" },
-    })) {
-      const existing = new Set(this.db.prepare(`PRAGMA table_info(${table})`).all().map(r => r.name));
-      for (const [column, type] of Object.entries(columns)) {
-        if (!existing.has(column)) this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
-      }
-    }
+    this.db.exec("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA cache_size = -65536;");
+    const version = (this.db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version;
+    if (version !== SCHEMA_VERSION) this.reset();
+  }
+
+  /** The database is a cache: an older layout is dropped and rebuilt, never migrated. */
+  private reset(): void {
+    const objects = this.db.prepare("SELECT type,name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' AND type IN ('table','trigger')").all() as { type: string; name: string }[];
+    for (const o of objects.filter(o => o.type === "trigger")) this.db.exec(`DROP TRIGGER IF EXISTS "${o.name}"`);
+    for (const o of objects.filter(o => o.type === "table")) { try { this.db.exec(`DROP TABLE IF EXISTS "${o.name}"`); } catch { /* fts shadow table already gone */ } }
     this.db.exec(`
-      CREATE UNIQUE INDEX IF NOT EXISTS idx_symbols_id ON symbols(id);
-      CREATE INDEX IF NOT EXISTS idx_symbols_qualified ON symbols(qualified);
-      CREATE INDEX IF NOT EXISTS idx_edges_caller_id ON edges(caller_id);
-      CREATE INDEX IF NOT EXISTS idx_edges_callee_id ON edges(callee_id);
-      CREATE INDEX IF NOT EXISTS idx_refs_caller_id ON call_refs(caller_id);
-      CREATE TABLE IF NOT EXISTS analysis_files (path TEXT PRIMARY KEY, hash TEXT);
-      CREATE TABLE IF NOT EXISTS analysis_inputs (path TEXT PRIMARY KEY, stamp TEXT);
+      CREATE TABLE files (path TEXT PRIMARY KEY, mtime REAL, size INTEGER, lang TEXT, provider TEXT, imports TEXT, hints TEXT, default_export TEXT);
+      CREATE TABLE symbols (id TEXT PRIMARY KEY, name TEXT, kind TEXT, path TEXT, line INTEGER, end_line INTEGER, column INTEGER,
+        qualified TEXT, container TEXT, top INTEGER, signature TEXT, lang TEXT, family TEXT, provider TEXT);
+      CREATE INDEX symbols_name ON symbols(name);
+      CREATE INDEX symbols_path ON symbols(path);
+      CREATE INDEX symbols_container ON symbols(container) WHERE container != '';
+      CREATE TABLE bases (path TEXT, family TEXT, type TEXT, base TEXT);
+      CREATE INDEX bases_type ON bases(type);
+      CREATE INDEX bases_path ON bases(path);
+      CREATE TABLE calls (id INTEGER PRIMARY KEY, path TEXT, caller_id TEXT, name TEXT, recv TEXT, is_new INTEGER, line INTEGER,
+        status TEXT, via TEXT, target_id TEXT, candidates INTEGER, recv_last TEXT);
+      CREATE INDEX calls_recv ON calls(recv_last) WHERE recv_last != '';
+      CREATE TABLE deps (path TEXT, target TEXT, PRIMARY KEY (path, target)) WITHOUT ROWID;
+      CREATE INDEX deps_target ON deps(target);
+      CREATE TABLE aliases (path TEXT, name TEXT, alias TEXT);
+      CREATE INDEX aliases_name ON aliases(name);
+      CREATE INDEX aliases_path ON aliases(path);
+      CREATE INDEX calls_path ON calls(path);
+      CREATE INDEX calls_name ON calls(name);
+      CREATE INDEX calls_target ON calls(target_id) WHERE target_id IS NOT NULL;
+      CREATE INDEX calls_caller ON calls(caller_id) WHERE ${LINKED};
+      CREATE TABLE candidates (call_id INTEGER, target_id TEXT);
+      CREATE INDEX candidates_call ON candidates(call_id);
+      CREATE INDEX candidates_target ON candidates(target_id);
+      CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);
     `);
-    this.taskIndex = new TaskContextIndex(this.db, this.checkCancelled);
-    this.journal = new ChangeJournal(this.db);
-    this.journalExtensions = new Set([...Object.keys(LANG),...LANGUAGE_SERVERS.flatMap(p => Object.keys(p.languages)),
-      ...(Array.isArray(options.providers) ? options.providers.flatMap(p => Object.keys(p.languages)) : [])]);
+    try {
+      this.db.exec(`CREATE VIRTUAL TABLE symbols_fts USING fts5(name, qualified, path, content='', contentless_delete=1);
+        CREATE TRIGGER symbols_fts_delete AFTER DELETE ON symbols BEGIN DELETE FROM symbols_fts WHERE rowid=OLD.rowid; END;`);
+    } catch { this.fts = false; /* SQLite without FTS5: context() falls back to LIKE */ }
+    this.db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
   }
 
   // ------------------------------------------------------------- building
-  /** Full rebuild. */
-  build(signal?: AbortSignal): Promise<{ files: number; symbols: number; edges: number }> {
-    return this.schedule(true, signal);
-  }
+  /** Re-parse everything. */
+  build(): Promise<IndexStats> { return this.schedule(true); }
+  /** Bring the graph up to date with the files on disk; cheap when nothing changed. */
+  refresh(): Promise<IndexStats> { return this.schedule(false); }
 
-  /**
-   * Parse changed files and reconcile cached references when names appear/disappear.
-   * For a stable workspace, canonical graph rows must equal a clean build after
-   * additions, deletions, renames or export edits. Compiler bindings and heuristic references stay explicitly separate.
-   */
-  refresh(signal?: AbortSignal): Promise<{ files: number; symbols: number; edges: number }> {
-    return this.schedule(false, signal);
-  }
-
-  private schedule(rebuild: boolean, signal?: AbortSignal): Promise<{ files: number; symbols: number; edges: number }> {
-    const next = (this.updating ?? Promise.resolve()).catch(() => {}).then(() => {
+  private schedule(rebuild: boolean): Promise<IndexStats> {
+    // Concurrent callers share one update; a rebuild waits for it and then runs.
+    if (this.running && !rebuild) return this.running;
+    const next = (this.running ?? Promise.resolve()).catch(() => {}).then(() => {
       if (this.closed) throw new Error("Indexer is closed.");
-      signal?.throwIfAborted();
-      this.checkCancelled();
-      return this.update(rebuild, signal);
+      return this.update(rebuild);
     });
-    this.updating = next;
-    void next.finally(() => { if (this.updating === next) this.updating = undefined; }).catch(() => {});
+    this.running = next;
+    void next.finally(() => { if (this.running === next) this.running = undefined; }).catch(() => {});
     return next;
   }
 
-  /** The same saved-source/configuration check gates updates and live reads. */
-  private inspect(rebuild = false) {
-    const providers = discoverProviders(this.options.providers);
-    const providerKey = hashText(JSON.stringify(providers.map(p => ({ ...p, executableStamp: diskStamp(p.command) }))));
-    let reparse = rebuild || this.meta("parser_version") !== PARSER_VERSION || providerKey !== this.meta("providers");
-    const supported = new Set([...Object.keys(LANG), ...LANGUAGE_SERVERS.flatMap(p => Object.keys(p.languages)), ...providers.flatMap(p => Object.keys(p.languages))]);
-    this.journalExtensions = supported;
-    const generation = this.meta("generation");
-    if (!this.fileStampsCache || this.fileStampsCache.generation !== generation) {
-      this.fileStampsCache = { generation,files:new Map<string,FileStamp>(
-        (this.db.prepare("SELECT path, mtime_ms, ctime_ms, size FROM files").all() as unknown as (FileStamp & {path:string})[])
-          .map(r => [r.path,r])) };
-    }
-    const known = this.fileStampsCache.files;
-    const current = new Map<string, { abs: string; stamp: FileStamp }>();
-    const changed = new Set<string>();
-    const controls: string[] = [];
-    const controlFiles = new Map<string, FileStamp>();
-    const directories = new Set<string>();
-    for (const abs of walk(this.workspace, this.checkCancelled, dir => directories.add(dir))) {
-      if (isAnalysisControl(abs)) {
-        controls.push(`${abs}:${diskStamp(abs)}`);
-        const s = fs.statSync(abs);
-        controlFiles.set(path.relative(this.workspace,abs), { mtime_ms:s.mtimeMs,ctime_ms:s.ctimeMs,size:s.size });
+  private scan(): { files: Map<string, { mtime: number; size: number }>; goMods: string[] } {
+    const files = new Map<string, { mtime: number; size: number }>(), goMods: string[] = [];
+    const requested = this.options.maxFiles ?? Number(process.env.FABER_GRAPH_MAX_FILES ?? 20_000);
+    const limit = Number.isFinite(requested) && requested > 0 ? Math.floor(requested) : 20_000;
+    this.skipped = 0;
+    const walk = (dir: string): void => {
+      let entries: fs.Dirent[];
+      try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+      entries.sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
+      for (const entry of entries) {
+        if (entry.name.startsWith(".") || SKIP_DIRS.has(entry.name)) continue;
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) { walk(full); continue; }
+        if (!entry.isFile()) continue;
+        if (entry.name === "go.mod") goMods.push(posix(path.relative(this.workspace, full)));
+        if (!languageFor(path.extname(entry.name)) || /\.min\.\w+$/.test(entry.name)) continue;
+        let stat: fs.Stats;
+        try { stat = fs.statSync(full); } catch { continue; }
+        if (stat.size > MAX_FILE_BYTES) continue;
+        if (files.size >= limit) { this.skipped++; continue; }
+        files.set(posix(path.relative(this.workspace, full)), { mtime: stat.mtimeMs, size: stat.size });
       }
-      if (!supported.has(path.extname(abs))) continue;
-      const rel = path.relative(this.workspace, abs), stat = fs.statSync(abs);
-      if (stat.size > 1_000_000) continue;
-      const stamp = { mtime_ms: stat.mtimeMs, ctime_ms: stat.ctimeMs, size: stat.size };
-      current.set(rel, { abs, stamp });
-      const prev = known.get(rel);
-      if (reparse || prev?.mtime_ms !== stamp.mtime_ms || prev?.ctime_ms !== stamp.ctime_ms || prev?.size !== stamp.size) changed.add(rel);
+    };
+    walk(this.workspace);
+    return { files, goMods };
+  }
+
+  private async update(rebuild: boolean): Promise<IndexStats> {
+    const { files: current, goMods } = this.scan();
+    const known = new Map((this.db.prepare("SELECT path,mtime,size FROM files").all() as { path: string; mtime: number; size: number }[]).map(r => [r.path, r]));
+    const goModules: [string, string][] = [];
+    for (const file of goMods) {
+      try {
+        const name = /^\s*module\s+(\S+)/m.exec(fs.readFileSync(path.join(this.workspace, file), "utf8"))?.[1];
+        if (name) goModules.push([name, dirOf(file)]);
+      } catch { /* unreadable go.mod: imports from it stay external */ }
     }
+    goModules.sort((a, b) => b[0].length - a[0].length);
+    const moduleKey = JSON.stringify(goModules);
+    const changed = [...current.keys()].filter(p => { const k = known.get(p), c = current.get(p)!; return rebuild || !k || k.mtime !== c.mtime || k.size !== c.size; });
     const removed = [...known.keys()].filter(p => !current.has(p));
-    let compilerPath = projectTypeScript(this.workspace, this.options.typescript);
-    const requestedLimit = this.options.semanticFileLimit ?? Number(process.env.FABER_GRAPH_MAX_FILES ?? 1000);
-    const limit = Number.isFinite(requestedLimit) && requestedLimit >= 0 ? Math.floor(requestedLimit) : 1000;
-    const semanticCount = [...current.keys()].filter(p => JS_EXTENSIONS.has(path.extname(p))).length;
-    const guarded = !!compilerPath && semanticCount > limit;
-    if (guarded) compilerPath = undefined;
-    // Do not key the cache on file count: every addition would invalidate it.
-    const compilerKey = compilerPath ? `${compilerPath}:${diskStamp(compilerPath)}:${limit}` : `heuristic:${limit}:${guarded ? "size-guard" : "no-provider"}`;
-    if (compilerKey !== this.meta("compiler")) reparse = true;
-    if (reparse) for (const rel of current.keys()) changed.add(rel);
-    const controlHash = hashText(controls.sort().join("\n"));
-    const inputRows = this.db.prepare("SELECT path, stamp FROM analysis_inputs").all();
-    const inputStates = inputRows.map(row => {
-      const file = row.path as string, previous = row.stamp as string;
-      // Source changes use dependency invalidation, not a cold compiler restart.
-      return current.has(path.relative(this.workspace, file)) ? previous : inputStamp(file, previous);
-    });
-    const envKey = environmentKey();
-    const inputsChanged = this.meta("inputs_unverified") === generation || envKey !== this.meta("environment") || controlHash !== this.meta("controls") ||
-      inputRows.some((row, i) => inputStates[i] !== row.stamp);
-    this.observeInventory?.({ directories, extensions: supported,
-      inputs: new Set(inputRows.map(row => row.path as string)),
-      inputDirectories: new Set(inputRows.filter(row => (row.stamp as string).startsWith("entries:")).map(row => row.path as string)) });
-    const revision = hashText(JSON.stringify([providerKey, compilerKey, controlHash, envKey,
-      [...current].map(([rel, f]) => [rel, f.stamp]), inputStates, this.meta("inputs_unverified")]));
-    return { providers, providerKey, reparse, supported, known, current, changed, removed, compilerPath, compilerKey, directories,
-      guarded, limit, semanticCount, controlHash, controlFiles, inputsChanged, revision, envKey, inputRows, inputStates };
+    const modulesChanged = moduleKey !== (this.meta("go_modules") ?? "[]");
+    if (!changed.length && !removed.length && !modulesChanged && this.isBuilt()) return this.counts(0);
+
+    // Small updates are one atomic transaction. A large build commits parsed files in
+    // batches to bound memory, marked dirty until its final resolve pass has run.
+    const multi = changed.length > BATCH;
+    const added = changed.some(p => !known.has(p));
+    // Resolve every call again only when nothing narrower is safe.
+    const full = rebuild || modulesChanged || multi || !this.isBuilt() || this.meta("dirty") === "1";
+    // What an incremental update must look at again (see resolve()).
+    const names = new Set<string>(), typeNames = new Set<string>(), seeds = new Set<string>();
+    const rebased = new Map<string, Set<string>>();
+    let namespacesChanged = false;
+    const setMeta = this.db.prepare("INSERT OR REPLACE INTO meta VALUES (?,?)");
+    const transaction = (work: () => void): void => {
+      this.db.exec("BEGIN");
+      try { work(); this.db.exec("COMMIT"); } catch (error) { this.db.exec("ROLLBACK"); throw error; }
+    };
+    let done = 0;
+    const parse = async (batch: string[]): Promise<Map<string, FileFacts>> => {
+      const parsed = new Map<string, FileFacts>();
+      for (const rel of batch) {
+        try {
+          const facts = await extractFile(rel, fs.readFileSync(path.join(this.workspace, rel), "utf8"));
+          if (facts) parsed.set(rel, facts);
+        } catch { /* unreadable file: indexed as empty */ }
+        if (++done % 25 === 0) { this.options.onProgress?.(done, changed.length); await new Promise<void>(resolve => setImmediate(resolve)); }
+        if (this.closed) throw new Error("Indexer is closed.");
+      }
+      return parsed;
+    };
+
+    const store = (batch: string[], gone: string[], parsed: Map<string, FileFacts>): void => {
+      const oldDefs = this.db.prepare("SELECT name,kind,qualified,container,top FROM symbols WHERE path=?");
+      const oldFile = this.db.prepare("SELECT imports,default_export FROM files WHERE path=?");
+      const oldBases = this.db.prepare("SELECT type,base FROM bases WHERE path=?");
+      const drop = [
+        this.db.prepare("DELETE FROM candidates WHERE call_id IN (SELECT id FROM calls WHERE path=?)"),
+        ...["calls", "symbols", "bases", "files", "aliases"].map(t => this.db.prepare(`DELETE FROM ${t} WHERE path=?`)),
+      ];
+      // Import targets are compared (and rewritten if different) in resolve(); only a deleted file loses them here.
+      const dropDeps = this.db.prepare("DELETE FROM deps WHERE path=?");
+      for (const rel of gone) dropDeps.run(rel);
+      for (const rel of [...batch, ...gone]) {
+        const facts = parsed.get(rel);
+        if (!full) this.diff(rel, facts, oldDefs.all(rel) as unknown as OldDef[], oldFile.get(rel) as { imports: string; default_export: string } | undefined,
+          oldBases.all(rel) as { type: string; base: string }[], { names, typeNames, seeds, rebased, namespaces: () => { namespacesChanged = true; } });
+        for (const statement of drop) statement.run(rel);
+      }
+      const insertFile = this.db.prepare("INSERT INTO files VALUES (?,?,?,?,?,?,?,?)");
+      const insertSymbol = this.db.prepare("INSERT INTO symbols VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
+      const insertFts = this.fts ? this.db.prepare("INSERT INTO symbols_fts(rowid,name,qualified,path) VALUES (?,?,?,?)") : undefined;
+      const insertBase = this.db.prepare("INSERT INTO bases VALUES (?,?,?,?)");
+      const insertAlias = this.db.prepare("INSERT INTO aliases VALUES (?,?,?)");
+      const insertCall = this.db.prepare("INSERT INTO calls (path,caller_id,name,recv,is_new,line,status,via,target_id,candidates,recv_last) VALUES (?,?,?,?,?,?,'unresolved','',NULL,0,?)");
+      for (const rel of batch) {
+        const stat = current.get(rel)!, facts = parsed.get(rel);
+        insertFile.run(rel, stat.mtime, stat.size, facts?.lang ?? "", facts?.provider ?? "", JSON.stringify(facts?.imports ?? []), JSON.stringify(facts?.hints ?? {}),
+          facts?.defaultExport ?? "");
+        if (!facts) continue;
+        const ids = facts.defs.map(d => `${rel}#${d.qualified}`), pathTerms = searchTerms(rel).join(" ");
+        facts.defs.forEach((d, i) => {
+          const row = insertSymbol.run(ids[i]!, d.name, d.kind, rel, d.line, d.endLine, d.column, d.qualified, d.container, d.top ? 1 : 0,
+            d.signature, facts.lang, facts.family, facts.provider);
+          if (d.kind !== "namespace") insertFts?.run(row.lastInsertRowid, searchTerms(d.name).join(" "), searchTerms(d.qualified).join(" "), pathTerms);
+        });
+        for (const [type, base] of [...facts.bases].sort()) insertBase.run(rel, facts.family, type, base);
+        for (const imp of facts.imports) if (imp.name && imp.name !== "*" && imp.alias && imp.alias !== imp.name) insertAlias.run(rel, imp.name, imp.alias);
+        for (const c of facts.calls) insertCall.run(rel, c.caller < 0 ? "" : ids[c.caller]!, c.name, c.recv, c.isNew ? 1 : 0, c.line, lastSegment(c.recv));
+      }
+    };
+
+    const resolve = (): void => {
+      const resolver = new Resolver(this.source(goModules));
+      const symbol = this.db.prepare("SELECT * FROM symbols WHERE id=?"), callers = new Map<string, Sym | undefined>();
+      const setCall = this.db.prepare("UPDATE calls SET status=?,via=?,target_id=?,candidates=? WHERE id=?");
+      const dropCandidates = this.db.prepare("DELETE FROM candidates WHERE call_id=?"), addCandidate = this.db.prepare("INSERT INTO candidates VALUES (?,?)");
+      const getCandidates = this.db.prepare("SELECT target_id FROM candidates WHERE call_id=? ORDER BY target_id");
+      const seen = new Set<number>();
+      let examined = 0;
+      const apply = (row: CallRow): void => {
+        if (!full) { if (seen.has(row.id)) return; seen.add(row.id); }
+        examined++;
+        const spec = languageFor(path.extname(row.path));
+        if (!spec) return;
+        let caller: Sym | undefined;
+        if (row.caller_id) {
+          if (!callers.has(row.caller_id)) callers.set(row.caller_id, symbol.get(row.caller_id) as unknown as Sym | undefined);
+          caller = callers.get(row.caller_id);
+        }
+        const r: Resolution = resolver.resolve(row.path, spec, { name: row.name, recv: row.recv, isNew: !!row.is_new }, caller);
+        const target = r.status === "resolved" || r.status === "inferred" ? r.targets[0]! : null;
+        const candidates = r.status === "ambiguous" ? r.targets : [];
+        if (row.status === r.status && row.via === r.via && row.target_id === target && row.candidates === r.count &&
+          (r.status !== "ambiguous" || (getCandidates.all(row.id) as { target_id: string }[]).map(c => c.target_id).join("\0") === candidates.join("\0"))) return;
+        setCall.run(r.status, r.via, target, r.count, row.id);
+        if (row.status === "ambiguous") dropCandidates.run(row.id);
+        for (const id of candidates) addCandidate.run(row.id, id);
+      };
+
+      // Import targets per file. They can shift for any file when the set of files (or namespaces) changes.
+      const everyFile = full || added || removed.length > 0 || namespacesChanged;
+      const paths = everyFile ? (this.db.prepare("SELECT path FROM files").all() as { path: string }[]).map(r => r.path) : changed;
+      if (full) this.db.exec("DELETE FROM deps");
+      const before = new Map<string, string[]>();
+      const note = (row: { path: string; target: string }) => { const list = before.get(row.path); if (list) list.push(row.target); else before.set(row.path, [row.target]); };
+      if (everyFile) for (const row of this.db.prepare("SELECT path,target FROM deps ORDER BY path,target").all() as { path: string; target: string }[]) note(row);
+      else { const own = this.db.prepare("SELECT path,target FROM deps WHERE path=? ORDER BY target"); for (const file of changed) for (const row of own.all(file) as { path: string; target: string }[]) note(row); }
+      const dropDeps = this.db.prepare("DELETE FROM deps WHERE path=?"), addDep = this.db.prepare("INSERT OR IGNORE INTO deps VALUES (?,?)");
+      for (const file of paths) {
+        const now = resolver.directDeps(file);
+        if ((before.get(file) ?? []).join("\0") === now.join("\0")) continue;
+        seeds.add(file);
+        dropDeps.run(file);
+        for (const target of now) addDep.run(file, target);
+      }
+
+      if (full) {
+        const page = this.db.prepare("SELECT * FROM calls WHERE id>? ORDER BY id LIMIT 20000");
+        for (let after = 0; ;) {
+          const rows = page.all(after) as unknown as CallRow[];
+          if (!rows.length) break;
+          for (const row of rows) apply(row);
+          after = rows[rows.length - 1]!.id;
+        }
+      } else {
+        // 1. Files whose view of the repository changed: every file that can reach a file whose imports,
+        //    default export or import targets changed (re-exports and reachability), plus the edited files.
+        const affected = new Set<string>(seeds);
+        const importers = this.db.prepare("SELECT path FROM deps WHERE target=?");
+        let frontier = [...seeds];
+        for (let hop = 0; hop <= Math.max(REACH_HOPS, EXPORT_HOPS) && frontier.length; hop++) {
+          const next: string[] = [];
+          for (const file of frontier) for (const { path: importer } of importers.all(file) as { path: string }[]) if (!affected.has(importer)) { affected.add(importer); next.push(importer); }
+          frontier = next;
+        }
+        const byPath = this.db.prepare("SELECT * FROM calls WHERE path=?");
+        for (const file of new Set([...changed, ...affected])) for (const row of byPath.all(file) as unknown as CallRow[]) apply(row);
+
+        // 2. Calls anywhere that use a name whose definitions changed — under that name or an import alias of it.
+        const alias = this.db.prepare("SELECT DISTINCT alias FROM aliases WHERE name=?");
+        const withAliases = (set: Set<string>) => { for (const name of [...set]) for (const row of alias.all(name) as { alias: string }[]) set.add(row.alias); };
+        // Methods are found through a type and its supertypes. When a supertype link changed, a type name
+        // appeared or vanished, or the file declaring a link sees different files, every method on that
+        // line of descent can now mean something else, wherever it is called.
+        const declared = this.db.prepare("SELECT DISTINCT type FROM bases WHERE path=?");
+        for (const file of affected) for (const row of declared.all(file) as { type: string }[]) if (!rebased.has(row.type)) rebased.set(row.type, new Set());
+        for (const type of typeNames) if (!rebased.has(type)) rebased.set(type, new Set());
+        if (rebased.size) {
+          const parents = this.db.prepare("SELECT DISTINCT base FROM bases WHERE type=?"), methods = this.db.prepare("SELECT DISTINCT name FROM symbols WHERE container=?");
+          const lineage = new Set<string>();
+          const climb = (type: string): void => {
+            if (lineage.has(type)) return;
+            lineage.add(type);
+            for (const row of parents.all(type) as { base: string }[]) climb(row.base);
+          };
+          for (const [type, previous] of rebased) { climb(type); for (const parent of previous) climb(parent); }
+          for (const type of lineage) for (const row of methods.all(type) as { name: string }[]) names.add(row.name);
+        }
+        withAliases(names); withAliases(typeNames);
+        const byName = this.db.prepare("SELECT * FROM calls WHERE name=?"), byReceiver = this.db.prepare("SELECT * FROM calls WHERE recv_last=? AND recv_last != ''");
+        for (const name of names) for (const row of byName.all(name) as unknown as CallRow[]) apply(row);
+        // 3. Calls on a receiver named like a type that appeared, disappeared or changed kind.
+        for (const name of typeNames) for (const row of byReceiver.all(name) as unknown as CallRow[]) apply(row);
+      }
+      setMeta.run("go_modules", moduleKey);
+      setMeta.run("built_at", String(Date.now()));
+      setMeta.run("generation", String(this.generation() + 1));
+      setMeta.run("skipped", String(this.skipped));
+      setMeta.run("dirty", "0");
+      this.lastUpdate = { files: changed.length, calls: examined, full };
+    };
+
+    if (!multi) {
+      const parsed = await parse(changed);
+      transaction(() => { store(changed, removed, parsed); resolve(); });
+    } else {
+      setMeta.run("dirty", "1");
+      for (let offset = 0; offset < changed.length; offset += BATCH) {
+        const batch = changed.slice(offset, offset + BATCH), parsed = await parse(batch);
+        transaction(() => store(batch, offset ? [] : removed, parsed));
+      }
+      transaction(resolve);
+    }
+    this.options.onProgress?.(changed.length, changed.length);
+    return this.counts(changed.length + removed.length);
   }
 
-  /** Recheck disk facts against one captured inventory, without rereading or
-   * rebuilding unchanged SQLite metadata. Profiling identified repeated scans
-   * as the foreground cost; every source path and external input is still checked.
+  /**
+   * Compare a file's old and new facts and record what other files could notice:
+   * names whose definitions changed, type names that appeared or vanished, types
+   * whose supertypes changed, and whether its imports or default export moved.
+   * Line numbers, bodies and signatures are deliberately not part of this.
    */
-  private sameSavedRevision(before: ReturnType<CodeIndexer["inspect"]>, generation: number): boolean {
-    const expected = new Map([...before.current.values()].map(f => [f.abs, f.stamp]));
-    const controls: string[] = []; let count = 0;
-    for (const abs of walk(this.workspace, this.checkCancelled)) {
-      if (isAnalysisControl(abs)) controls.push(`${abs}:${diskStamp(abs)}`);
-      if (!before.supported.has(path.extname(abs))) continue;
-      const stat = fs.statSync(abs);
-      if (stat.size > 1_000_000) continue;
-      const previous = expected.get(abs); count++;
-      if (!previous || stat.mtimeMs !== previous.mtime_ms || stat.ctimeMs !== previous.ctime_ms || stat.size !== previous.size) return false;
+  private diff(rel: string, facts: FileFacts | undefined, defs: OldDef[], file: { imports: string; default_export: string } | undefined,
+    bases: { type: string; base: string }[], out: { names: Set<string>; typeNames: Set<string>; seeds: Set<string>; rebased: Map<string, Set<string>>; namespaces: () => void }): void {
+    const group = <T>(items: T[], key: (item: T) => string, value: (item: T) => string) => {
+      const map = new Map<string, string[]>();
+      for (const item of items) { const list = map.get(key(item)); if (list) list.push(value(item)); else map.set(key(item), [value(item)]); }
+      for (const list of map.values()) list.sort();
+      return map;
+    };
+    const differing = (a: Map<string, string[]>, b: Map<string, string[]>) =>
+      [...new Set([...a.keys(), ...b.keys()])].filter(key => (a.get(key) ?? []).join("\n") !== (b.get(key) ?? []).join("\n"));
+    const now = facts?.defs ?? [];
+    const changedNames = differing(group(defs, d => d.name, d => `${d.kind}\0${d.qualified}\0${d.container}\0${d.top}`),
+      group(now, d => d.name, d => `${d.kind}\0${d.qualified}\0${d.container}\0${d.top ? 1 : 0}`));
+    for (const name of changedNames) out.names.add(name);
+    const isType = (d: { kind: string }) => CLASS_KINDS.has(d.kind);
+    for (const name of differing(group(defs.filter(isType), d => d.name, d => d.kind), group(now.filter(isType), d => d.name, d => d.kind))) out.typeNames.add(name);
+    const namespaces = (list: { kind: string; qualified: string }[]) => list.filter(d => d.kind === "namespace").map(d => d.qualified).sort().join("\n");
+    if (namespaces(defs) !== namespaces(now)) {
+      // Joining or leaving a namespace shows or hides everything in the file to that namespace's other files.
+      out.namespaces();
+      for (const d of [...defs, ...now]) out.names.add(d.name);
     }
-    if (count !== expected.size || hashText(controls.sort().join("\n")) !== before.controlHash || environmentKey() !== before.envKey) return false;
-    for (let i = 0; i < before.inputRows.length; i++) {
-      this.checkCancelled();
-      const row = before.inputRows[i]!;
-      if (!expected.has(row.path as string) && inputStamp(row.path as string, row.stamp as string) !== before.inputStates[i]) return false;
+    const oldBases = group(bases, b => b.type, b => b.base);
+    for (const type of differing(oldBases, group(facts?.bases ?? [], b => b[0], b => b[1]))) {
+      const previous = out.rebased.get(type) ?? new Set<string>();
+      for (const base of oldBases.get(type) ?? []) previous.add(base);
+      out.rebased.set(type, previous);
     }
-    const providers = discoverProviders(this.options.providers);
-    if (hashText(JSON.stringify(providers.map(p => ({ ...p, executableStamp: diskStamp(p.command) })))) !== before.providerKey) return false;
-    let compiler = projectTypeScript(this.workspace, this.options.typescript);
-    if (before.guarded) compiler = undefined;
-    const compilerKey = compiler ? `${compiler}:${diskStamp(compiler)}:${before.limit}`
-      : `heuristic:${before.limit}:${before.guarded ? "size-guard" : "no-provider"}`;
-    return compilerKey === before.compilerKey && Number(this.meta("generation") ?? 0) === generation;
+    // Importers reach other files through this one's imports, and bind its default export under their own names.
+    const defaultBefore = file?.default_export ?? "", defaultNow = facts?.defaultExport ?? "";
+    if ((file?.imports ?? "[]") !== JSON.stringify(facts?.imports ?? []) || defaultBefore !== defaultNow ||
+      changedNames.some(name => name === defaultBefore || name === defaultNow)) out.seeds.add(rel);
   }
 
-  /** Run external analyzers before the transaction; publish one atomic generation. */
-  private async update(rebuild: boolean, signal?: AbortSignal): Promise<{ files: number; symbols: number; edges: number }> {
-    const timing = new AnalysisTimer(this.observeProgress);
-    try {
-      const result = await this.updateGraph(rebuild,signal,timing);
-      timing.stage("complete",{generation:Number(this.meta("generation") ?? 0),coverage:this.meta("coverage")?.slice(0,4000)});
-      return result;
-    } catch (error) {
-      timing.stage(signal?.aborted || /cancelled/i.test(String(error)) ? "cancelled" : "failed");
-      throw error;
+  /** Keyed, cached lookups for the resolver, valid for one update. */
+  private source(goModules: [string, string][]): GraphSource {
+    const files = (this.db.prepare("SELECT path FROM files").all() as { path: string }[]).map(r => r.path);
+    const fileSet = new Set(files), byBase = new Map<string, string[]>(), byDir = new Map<string, string[]>(), dirsByLeaf = new Map<string, string[]>();
+    const push = (map: Map<string, string[]>, key: string, value: string) => { const list = map.get(key); if (list) list.push(value); else map.set(key, [value]); };
+    for (const file of files) {
+      push(byBase, file.slice(file.lastIndexOf("/") + 1), file);
+      const dir = dirOf(file);
+      if (!byDir.has(dir)) push(dirsByLeaf, dir.slice(dir.lastIndexOf("/") + 1), dir);
+      push(byDir, dir, file);
     }
-  }
-  private async updateGraph(rebuild: boolean, signal: AbortSignal | undefined, timing: AnalysisTimer): Promise<{ files: number; symbols: number; edges: number }> {
-    const inventory = this.inspect(rebuild);
-    this.captureChanges(inventory);
-    const pendingChanges = this.journal.pending();
-    const { providers, providerKey, reparse, supported, known, current, changed, removed, compilerPath, compilerKey,
-      guarded, limit, semanticCount, controlHash, inputsChanged, envKey } = inventory;
-    timing.stage("language_servers",{fileCount:current.size,providers:providers.map(p => p.id)});
-    if (!reparse && !changed.size && !removed.length && !inputsChanged) {
-      this.journal.incorporate(pendingChanges, Number(this.meta("generation") ?? 0));
-      return this.counts(0);
-    }
-
-    if (providerKey !== this.languagesKey || rebuild || inputsChanged) {
-      this.languages?.close(); this.languages = undefined; this.languagesKey = providerKey;
-    }
-    this.cacheInventory = inventory;
-    this.cacheKey = hashText(JSON.stringify([this.workspace, providerKey, controlHash, envKey, PARSER_VERSION]));
-    this.languages ??= new LspGraph(this.workspace, providers, {
-      load: (id, limit) => this.cacheStore.load(id, limit),
-      save: (id, data, inputs, context, limit) => this.saveAnalyzerCache(id, data, inputs, context, limit),
-      invalidate: (inputs, context) => this.invalidateAnalyzerInputs(inputs, context),
-      progress: value => this.observeDependency?.(value),
+    const namespace = this.db.prepare("SELECT DISTINCT path FROM symbols WHERE kind='namespace' AND (qualified=? OR qualified LIKE ? ESCAPE '\\')");
+    const modules: ModuleIndex = {
+      has: file => fileSet.has(file),
+      suffix: tail => (byBase.get(tail.slice(tail.lastIndexOf("/") + 1)) ?? []).filter(f => f === tail || f.endsWith("/" + tail)),
+      dirs: tail => (dirsByLeaf.get(tail.slice(tail.lastIndexOf("/") + 1)) ?? []).filter(d => d === tail || d.endsWith("/" + tail)),
+      inDir: dir => byDir.get(dir) ?? [],
+      goModules,
+      namespace: name => (namespace.all(name, `${escapeLike(name)}~%`) as { path: string }[]).map(r => r.path),
+    };
+    const cached = <T>(load: (key: string) => T) => { const map = new Map<string, T>(); return (key: string): T => { let v = map.get(key); if (v === undefined) { v = load(key); map.set(key, v); } return v; }; };
+    const byName = this.db.prepare("SELECT * FROM symbols WHERE family=? AND name=? ORDER BY id");
+    const inFile = this.db.prepare("SELECT * FROM symbols WHERE path=? ORDER BY id");
+    const bases = this.db.prepare("SELECT DISTINCT base, path FROM bases WHERE family=? AND type=? ORDER BY base, path");
+    const file = this.db.prepare("SELECT imports,hints,default_export FROM files WHERE path=?");
+    const names = cached(key => { const [family, name] = key.split("\0"); return byName.all(family!, name!) as unknown as Sym[]; });
+    const inFiles = cached(key => inFile.all(key) as unknown as Sym[]);
+    const supers = cached(key => { const [family, type] = key.split("\0"); return bases.all(family!, type!) as { base: string; path: string }[]; });
+    const fileRow = cached(key => {
+      const row = file.get(key) as { imports: string; hints: string; default_export: string } | undefined;
+      return { imports: JSON.parse(row?.imports ?? "[]") as Import[], hints: JSON.parse(row?.hints ?? "{}") as Record<string, string[]>,
+        defaultExport: row?.default_export ?? "" };
     });
-    const all = [...current.values()].map(f => f.abs);
-    const changedPaths = new Set([...changed].map(p => current.get(p)!.abs));
-    let external: ProviderFacts;
-    try {
-      const context: CacheContext = { key: this.cacheKey, generation: Number(this.meta("generation") ?? 0),
-        sources: new Map([...current.values()].map(f => [f.abs, stampRevision(f.stamp)])),
-        facts: new Map(this.db.prepare("SELECT path,hash FROM analysis_files").all().map(row => [path.join(this.workspace, row.path as string), row.hash as string])),
-        inputs: new Map(inventory.inputRows.map((row, i) => [row.path as string, inventory.inputStates[i]!])),
-        directories: new Map([...inventory.directories].map(dir => [dir, dependencyInputStamp(dir)])) };
-      external = await this.languages.analyze(all, changedPaths, removed.map(p => path.join(this.workspace, p)), reparse || inputsChanged, signal, context);
-      if (this.closed) throw new Error("Indexer is closed.");
-      signal?.throwIfAborted();
-      this.checkCancelled();
-    } catch (error) {
-      this.languages?.close(); this.languages = undefined; throw error;
-    }
-    timing.stage("database_setup",{analyzerFiles:external.files.size});
-    this.db.exec("BEGIN");
-    try {
-      const previousNames = new Set(this.db.prepare("SELECT DISTINCT name FROM symbols").all().map(r => r.name as string));
-      if (rebuild || inputsChanged || this.compilerKey !== compilerKey) {
-        this.compiler?.close(); this.compiler = undefined;
-      }
-      this.compilerKey = compilerKey;
-      timing.stage("compiler",{compilerEnabled:!!compilerPath});
-      if (compilerPath && !this.compiler) this.compiler = new TypeScriptGraph(compilerPath, this.workspace, this.checkCancelled);
-      const semantic = this.compiler?.analyze(all.filter(p => !external.files.has(p)), changedPaths,
-        removed.length > 0 || [...changed].some(p => !known.has(p))) ?? new Map<string, FileFacts>();
-      for (const [file, value] of external.facts) semantic.set(file, value);
-      timing.stage("facts",{analyzerFiles:semantic.size});
-      const hashes = new Map(this.db.prepare("SELECT path, hash FROM analysis_files").all().map(r => [r.path as string, r.hash as string]));
-      const facts = new Map<string, FileFacts>(), newHashes = new Map<string, string>();
-      for (const [abs, value] of semantic) {
-        this.checkCancelled();
-        const rel = path.relative(this.workspace, abs), hash = hashText(JSON.stringify(value));
-        if (reparse || hashes.get(rel) !== hash) { facts.set(rel, value); newHashes.set(rel, hash); }
-      }
-      for (const [rel, f] of current) {
-        this.checkCancelled();
-        if (!external.files.has(f.abs) && !this.compiler?.files.has(f.abs) && (changed.has(rel) || hashes.has(rel))) {
-          facts.set(rel, heuristicFacts(fs.readFileSync(f.abs, "utf8"), rel));
-        }
-      }
-      timing.stage("publication");
-      if (rebuild) this.db.exec("DELETE FROM symbols; DELETE FROM edges; DELETE FROM imports; DELETE FROM call_refs; DELETE FROM files; DELETE FROM analysis_files;");
-      const delSym = this.db.prepare("DELETE FROM symbols WHERE path=?"), delEdge = this.db.prepare("DELETE FROM edges WHERE path=?");
-      const delImp = this.db.prepare("DELETE FROM imports WHERE src=?"), delRef = this.db.prepare("DELETE FROM call_refs WHERE path=?");
-      const delHash = this.db.prepare("DELETE FROM analysis_files WHERE path=?"), delFile = this.db.prepare("DELETE FROM files WHERE path=?");
-      for (const rel of new Set([...removed, ...facts.keys()])) {
-        this.checkCancelled();
-        delSym.run(rel); delEdge.run(rel); delImp.run(rel); delRef.run(rel); delHash.run(rel);
-      }
-      for (const rel of removed) delFile.run(rel);
-      const insSym = this.db.prepare("INSERT INTO symbols (name,kind,path,line,signature,id,qualified,end_line,column,provider) VALUES (?,?,?,?,?,?,?,?,?,?)");
-      const insImp = this.db.prepare("INSERT INTO imports VALUES (?,?,?)");
-      const insHash = this.db.prepare("INSERT OR REPLACE INTO analysis_files VALUES (?,?)");
-      // Pass 1 publishes all declarations before resolving any reference.
-      for (const [rel, f] of facts) {
-        this.checkCancelled();
-        for (const s of f.symbols) {
-          const row = insSym.run(s.name,s.kind,s.path,s.line,s.signature,s.id,s.qualified,s.end_line,s.column,s.provider);
-          this.taskIndex.add(s, row.lastInsertRowid);
-        }
-        for (const i of f.imports) insImp.run(rel,i.target,i.line);
-        if (newHashes.has(rel)) insHash.run(rel,newHashes.get(rel)!);
-      }
-      const knownNames = new Set(this.db.prepare("SELECT DISTINCT name FROM symbols").all().map(r => r.name as string));
-      const delCallee = this.db.prepare("DELETE FROM edges WHERE callee=? AND status='heuristic'");
-      const resolveRefs = this.db.prepare(`INSERT INTO edges (caller,callee,path,line,caller_id,status,dispatch)
-        SELECT caller,callee,path,line,caller_id,status,dispatch FROM call_refs WHERE callee=? AND status='heuristic'`);
-      for (const name of previousNames) if (!knownNames.has(name)) delCallee.run(name);
-      // Changed files' references are absent here, avoiding duplicate insertions.
-      for (const name of knownNames) if (!previousNames.has(name)) resolveRefs.run(name);
-      const insRef = this.db.prepare("INSERT INTO call_refs (caller,callee,path,line,id,caller_id,target_id,status,dispatch,position) VALUES (?,?,?,?,?,?,?,?,?,?)");
-      const resolveExact = this.db.prepare(`INSERT INTO edges
-        SELECT r.caller,r.callee,r.path,r.line,r.caller_id,s.id,s.path,s.line,r.status,r.dispatch
-        FROM call_refs r JOIN symbols s ON s.id=r.target_id WHERE r.path=?`);
-      const insHint = this.db.prepare("INSERT INTO edges (caller,callee,path,line,caller_id,status,dispatch) VALUES (?,?,?,?,?,?,?)");
-      for (const [rel, f] of facts) {
-        this.checkCancelled();
-        for (const r of f.refs) insRef.run(r.caller,r.callee,r.path,r.line,r.id,r.caller_id,r.target_id,r.status,r.dispatch,r.position);
-        resolveExact.run(rel);
-        for (const r of f.refs) if (r.status === "heuristic" && knownNames.has(r.callee)) insHint.run(r.caller,r.callee,r.path,r.line,r.caller_id,r.status,r.dispatch);
-      }
-      this.db.exec("DELETE FROM edges WHERE callee_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM symbols s WHERE s.id=edges.callee_id)");
-      // An edit may move a declaration's line without changing its character offset/ID.
-      this.db.exec(`UPDATE edges AS e SET callee_path=s.path,callee_line=s.line FROM symbols s
-        WHERE e.callee_id=s.id AND (e.callee_path IS NOT s.path OR e.callee_line IS NOT s.line)`);
-      const upFile = this.db.prepare("INSERT OR REPLACE INTO files (path,mtime_ms,ctime_ms,size) VALUES (?,?,?,?)");
-      for (const rel of changed) {
-        const f = current.get(rel)!; upFile.run(rel,f.stamp.mtime_ms,f.stamp.ctime_ms,f.stamp.size);
-      }
-      timing.stage("source_validation");
-      for (const f of current.values()) {
-        this.checkCancelled();
-        const s = fs.statSync(f.abs);
-        if (s.mtimeMs !== f.stamp.mtime_ms || s.ctimeMs !== f.stamp.ctime_ms || s.size !== f.stamp.size) throw new Error("Source changed during indexing; retry the refresh.");
-      }
-      const afterFiles = new Set<string>(), afterControls: string[] = [];
-      for (const abs of walk(this.workspace, this.checkCancelled)) {
-        if (isAnalysisControl(abs)) afterControls.push(`${abs}:${diskStamp(abs)}`);
-        if (supported.has(path.extname(abs)) && fs.statSync(abs).size <= 1_000_000) afterFiles.add(path.relative(this.workspace, abs));
-      }
-      if (afterFiles.size !== current.size || [...afterFiles].some(p => !current.has(p)) || hashText(afterControls.sort().join("\n")) !== controlHash) {
-        throw new Error("Workspace files or project configuration changed during indexing; retry the refresh.");
-      }
-      signal?.throwIfAborted();
-      this.checkCancelled();
-      this.db.exec("DELETE FROM analysis_inputs");
-      const insInput = this.db.prepare("INSERT INTO analysis_inputs VALUES (?,?)");
-      const analysisInputs = new Map([...(this.compiler?.inputs ?? []), ...(this.languages?.inputs ?? [])]);
-      for (const [file, stamp] of analysisInputs) {
-        if (inputStamp(file,stamp) !== stamp) throw new Error(`Analysis input changed during indexing: ${file}; retry the refresh.`);
-        insInput.run(file,stamp);
-      }
-      const meta = this.db.prepare("INSERT OR REPLACE INTO meta VALUES (?,?)");
-      meta.run("generation", String(Number(this.meta("generation") ?? 0) + 1));
-      meta.run("built_at",String(Date.now())); meta.run("parser_version",PARSER_VERSION);
-      meta.run("providers",providerKey);
-      meta.run("compiler",compilerKey); meta.run("controls",controlHash);
-      meta.run("environment",envKey);
-      meta.run("inputs_unverified", "");
-      const fallbackCoverage = this.compiler?.description ?? (guarded
-        ? `Heuristic only: ${semanticCount} TS/JS files exceeds the compiler file limit (${limit}). Static call paths are unavailable. FABER_GRAPH_MAX_FILES can opt in; this is not a heap limit.`
-        : "Heuristic only for files without language-server or TS/JS compiler coverage. Static call paths from heuristic hints are unavailable.");
-      meta.run("coverage",[external.description, all.length > external.files.size ? fallbackCoverage : ""].filter(Boolean).join("\n"));
-      this.journal.incorporate(pendingChanges, Number(this.meta("generation")));
-      this.checkCancelled();
-      this.db.exec("COMMIT");
-      this.fileStampsCache = { generation:this.meta("generation"),files:new Map([...current].map(([rel,f]) => [rel,f.stamp])) };
-    } catch (error) {
-      this.db.exec("ROLLBACK"); this.compiler?.close(); this.compiler = undefined; this.languages?.close(); this.languages = undefined; throw error;
-    }
-    // Auxiliary caches are optional. Their failure must not fail an already
-    // committed call graph or delay it while independent discovery is running.
-    try { this.languages?.published(Number(this.meta("generation") ?? 0)); } catch { /* cold cache on next edit */ }
-    return this.counts(changed.size);
-  }
-
-  private saveAnalyzerCache(id: string, data: unknown, inputs: Map<string, string>, context: CacheContext, limit: number): boolean {
-    const inventory = this.cacheInventory;
-    if (this.closed || !inventory || this.cacheKey !== context.key || Number(this.meta("generation") ?? 0) !== context.generation) return false;
-    try {
-      if (!this.sameSavedRevision(inventory, context.generation) || [...inputs].some(([file, stamp]) => dependencyInputStamp(file) !== stamp)) return false;
-      const rows = new Map(this.db.prepare("SELECT path,hash FROM analysis_files").all().map(row => [path.join(this.workspace, row.path as string), row.hash as string]));
-      const files = (data as any)?.files;
-      if (!Array.isArray(files) || files.some(([file, value]: [string, any]) => factHash(value.facts) !== rows.get(file))) return false;
-      this.db.exec("BEGIN");
-      try {
-        if (!this.cacheStore.save(id, data, limit)) { this.db.exec("ROLLBACK"); return false; }
-        const insert = this.db.prepare("INSERT OR REPLACE INTO analysis_inputs (path,stamp) VALUES (?,?)");
-        for (const [file, stamp] of inputs) insert.run(file, stamp);
-        if (!this.sameSavedRevision(inventory, context.generation) || [...inputs].some(([file, stamp]) => dependencyInputStamp(file) !== stamp)) {
-          this.db.exec("ROLLBACK"); return false;
-        }
-        this.db.exec("COMMIT"); return true;
-      } catch { this.db.exec("ROLLBACK"); return false; }
-    } catch { return false; }
-  }
-
-  private invalidateAnalyzerInputs(inputs: Map<string, string>, context: CacheContext): void {
-    if (this.closed || this.cacheKey !== context.key || Number(this.meta("generation") ?? 0) !== context.generation) return;
-    try {
-      this.db.exec("BEGIN");
-      try {
-        const insert = this.db.prepare("INSERT OR REPLACE INTO analysis_inputs (path,stamp) VALUES (?,?)");
-        for (const file of inputs.keys()) insert.run(file, dependencyInputStamp(file));
-        this.db.prepare("INSERT OR REPLACE INTO meta (key,value) VALUES ('inputs_unverified',?)").run(String(context.generation));
-        this.db.exec("COMMIT");
-      } catch { this.db.exec("ROLLBACK"); }
-    } catch { /* optional metadata failure leaves caches unused */ }
+    return { modules, byName: (family, name) => names(`${family}\0${name}`), inFile: inFiles,
+      basesOf: (family, type) => supers(`${family}\0${type}`), imports: p => fileRow(p).imports, hints: p => fileRow(p).hints,
+      defaultExport: p => fileRow(p).defaultExport };
   }
 
   private meta(key: string): string | undefined {
     return (this.db.prepare("SELECT value FROM meta WHERE key=?").get(key) as { value: string } | undefined)?.value;
   }
-
-  private counts(files: number): { files: number; symbols: number; edges: number } {
-    const nSym = (this.db.prepare("SELECT COUNT(*) c FROM symbols").get() as any).c;
-    const nEdge = (this.db.prepare("SELECT COUNT(*) c FROM edges").get() as any).c;
-    return { files, symbols: nSym, edges: nEdge };
+  private counts(files: number): IndexStats {
+    const one = (sql: string) => (this.db.prepare(sql).get() as { c: number }).c;
+    return { files, symbols: one("SELECT COUNT(*) c FROM symbols"), edges: one(`SELECT COUNT(*) c FROM calls WHERE ${EDGE}`) };
   }
+  generation(): number { return Number(this.meta("generation") ?? 0); }
+  isBuilt(): boolean { return this.meta("built_at") != null; }
+  close(): void { if (this.closed) return; this.closed = true; this.db.close(); }
 
   // -------------------------------------------------------------- queries
-  /** Event recording is a stat and indexed lookup, never a repository scan/analyzer. */
-  recordChange(file?: string): void {
-    if (!file) return;
-    const abs = canonicalPath(path.resolve(this.workspace, file)), rel = path.relative(this.workspace, abs);
-    if (rel === ".." || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel) ||
-      rel.split(path.sep).some(part => SKIP_DIRS.has(part))) return;
-    if (!this.journalExtensions.has(path.extname(abs)) && !isAnalysisControl(abs)) return;
-    let stamp: FileStamp | undefined;
-    try { const s = fs.statSync(abs); if (!s.isFile()) return;
-      stamp = { mtime_ms: s.mtimeMs, ctime_ms: s.ctimeMs, size: s.size }; }
-    catch (error) { if (!/ENOENT|ENOTDIR/.test(String(error))) throw error; }
-    const old = this.db.prepare("SELECT mtime_ms,ctime_ms,size FROM files WHERE path=?").get(rel) as unknown as FileStamp | undefined;
-    const recorded = this.journal.get(rel);
-    if (recorded?.indexedGeneration === null && recorded.revision === (stamp ? stampRevision(stamp) : null)) return;
-    if (!stamp && !old && (!recorded || recorded.kind === "added" && recorded.indexedGeneration === null)) {
-      this.journal.discard(rel); return;
-    }
-    if (!stamp && !old && !isAnalysisControl(abs)) { this.journal.discard(rel); return; }
-    if (stamp && old && sameStamp(old, stamp)) return;
-    this.languages?.cancelInventory();
-    const existed = old || recorded && (recorded.indexedGeneration === null ? recorded.kind !== "added" : recorded.revision !== null);
-    this.journal.record(rel, stamp ? existed ? "modified" : "added" : "deleted",
-      stamp ? stampRevision(stamp) : null, isAnalysisControl(abs));
-  }
-  private captureChanges(before: ReturnType<CodeIndexer["inspect"]>): void {
-    this.journal.batch(() => {
-    for (const [rel, file] of before.current) {
-      const old = before.known.get(rel);
-      if (!old || !sameStamp(old,file.stamp)) this.journal.record(rel, old ? "modified" : "added", stampRevision(file.stamp),isAnalysisControl(rel));
-    }
-    for (const rel of before.removed) {
-      // A saved source can leave the index because it exceeds the size guard.
-      // Keep its actual revision; exclusion from the graph is not a deletion.
-      let stamp: FileStamp | undefined;
-      try { const s = fs.statSync(path.join(this.workspace,rel));
-        if (s.isFile()) stamp = {mtime_ms:s.mtimeMs,ctime_ms:s.ctimeMs,size:s.size}; }
-      catch (error) { if (!/ENOENT|ENOTDIR/.test(String(error))) throw error; }
-      this.journal.record(rel,stamp ? "modified" : "deleted",stamp ? stampRevision(stamp) : null);
-    }
-    for (const [rel,stamp] of before.controlFiles) {
-      if (before.current.has(rel)) continue;
-      const old = this.journal.get(rel), revision = stampRevision(stamp);
-      if (old?.revision === revision) continue;
-      this.journal.record(rel,old && (old.indexedGeneration === null ? old.kind !== "added" : old.revision !== null) ? "modified" : "added",revision,true);
-      if (!old && this.isBuilt() && before.controlHash === this.meta("controls")) {
-        this.journal.incorporate([this.journal.get(rel)!],Number(this.meta("generation") ?? 0));
-      }
-    }
-    for (const row of this.journal.controls()) if (row.revision !== null && !before.controlFiles.has(row.path)) {
-      if (row.kind === "added" && row.indexedGeneration === null) this.journal.discard(row.path);
-      else this.journal.record(row.path,"deleted",null,true);
-    }
-    // A newly added file can be deleted again before indexing; no graph change remains.
-    for (const row of this.journal.pending()) if (!before.current.has(row.path) && !before.known.has(row.path) &&
-      !isAnalysisControl(row.path)) this.journal.discard(row.path);
-    });
-  }
-  /** Metadata reconciliation recovers saves while Faber was stopped. No analyzer runs. */
-  changes(limit = 100, includeIndexed = false): ChangeList {
-    this.checkCancelled();
-    const before = this.inspect(); this.captureChanges(before);
-    return this.journal.list(Number(this.meta("generation") ?? 0), !this.isBuilt() || before.reparse || before.inputsChanged ||
-      !!before.changed.size || !!before.removed.length, limit, includeIndexed);
-  }
-  /** Never publish old bindings as current. This read does not run an analyzer. */
-  readCurrent<M extends LiveMethod>(method: M, args: unknown[], callerEnvironment = environmentKey()): CurrentGraph<LiveValues[M]> {
-    this.checkCancelled();
-    const generation = Number(this.meta("generation") ?? 0);
-    if (callerEnvironment !== environmentKey()) return { status: "pending", generation, revision: callerEnvironment,
-      reason: "The analyzer environment changed; bindings must be refreshed." };
-    const before = this.inspect();
-    this.captureChanges(before);
-    if (!this.isBuilt()) return { status: "not_built", generation, changed: [...before.current.keys()].slice(0,64),
-      reason: "The code graph is not built yet." };
-    const pending = () => ({ status: "pending" as const, generation, revision: before.revision,
-      changed: [...before.changed, ...before.removed].slice(0, 64),
-      reason: "Saved sources or analysis configuration changed; graph analysis is pending." });
-    if (before.reparse || before.inputsChanged || before.changed.size || before.removed.length) return pending();
-    let value: LiveValues[LiveMethod];
-    if (method === "prompt") {
-      const context = this.taskContext(args[0] as string, args[1] as ContextOptions | undefined);
-      let map: string | undefined;
-      if (args[2] !== generation) {
-        if (this.promptMap?.generation !== generation) this.promptMap = { generation, text: this.repoMap() };
-        map = this.promptMap.text;
-      }
-      value = { context, map };
-    } else if (["search", "whoCalls", "referencesFrom", "trace", "callTree", "taskContext"].includes(method)) {
-      value = (this[method as Exclude<LiveMethod, "prompt">] as (...args: any[]) => LiveValues[LiveMethod]).apply(this, args);
-    } else throw new Error("Unknown current-graph query.");
-    this.checkCancelled();
-    // Also reject edits made while retrieving/ranking the snapshot.
-    if (!this.sameSavedRevision(before, generation)) {
-      const after = this.inspect();
-      return { ...pending(), revision: after.revision, changed: [...after.changed, ...after.removed].slice(0, 64) };
-    }
-    return { status: "ready", generation, value: value as LiveValues[M] };
+  /** Definitions whose name or qualified name contains the query; exact names first. */
+  search(query: string, limit = 20): Sym[] {
+    const like = `%${escapeLike(query)}%`;
+    return this.db.prepare(`SELECT * FROM symbols WHERE kind!='namespace' AND (name LIKE ? ESCAPE '\\' OR qualified LIKE ? ESCAPE '\\')
+      ORDER BY CASE WHEN name=? THEN 0 WHEN name LIKE ? ESCAPE '\\' THEN 1 ELSE 2 END, path, line LIMIT ?`)
+      .all(like, like, query, `${escapeLike(query)}%`, bounded(limit, 20, 100)) as unknown as Sym[];
   }
 
-  search(query: string, limit = 20): Symbol[] {
-    return this.db.prepare(`SELECT * FROM symbols WHERE kind NOT IN ('module','initializer') AND (name LIKE ? OR qualified LIKE ?)
-      ORDER BY CASE WHEN name=? THEN 0 ELSE 1 END,name,path,line,column LIMIT ?`)
-      .all(`%${query}%`,`%${query}%`,query,bounded(limit,100)) as unknown as Symbol[];
+  /**
+   * Every definition a selector can mean. Accepts an exact ID (`src/a.ts#Store.save`),
+   * a qualified name (`Store.save`), a bare name (`save`) or an ID suffix (`a.ts#save`).
+   */
+  find(selector: string, limit = 20): Sym[] {
+    const exact = this.db.prepare("SELECT * FROM symbols WHERE id=?").get(selector) as unknown as Sym | undefined;
+    if (exact) return [exact];
+    // Every match is named by the selector's last segment, so the name index does the work.
+    const n = bounded(limit, 20, 100), wanted = selector.slice(selector.indexOf("#") + 1);
+    const rows = this.db.prepare("SELECT * FROM symbols WHERE name=? AND kind!='namespace' ORDER BY id LIMIT 5000")
+      .all(wanted.slice(wanted.lastIndexOf(".") + 1).replace(/~\d+$/, "")) as unknown as Sym[];
+    // `~2` marks a later overload or redefinition of the same qualified name.
+    const plain = (text: string) => text.replace(/~\d+$/, "");
+    const fits = (qualified: string) => qualified === selector || qualified.endsWith(`.${selector}`);
+    return rows.filter(s => selector.includes("#") ? s.id.endsWith(selector) || plain(s.id).endsWith(selector)
+      : fits(s.qualified) || fits(plain(s.qualified))).slice(0, n);
   }
 
-  private selectSymbol(selector: string): Symbol | undefined {
-    const exact = this.db.prepare("SELECT * FROM symbols WHERE id=?").get(selector) as unknown as Symbol | undefined;
-    if (exact) return exact;
-    const matches = this.db.prepare("SELECT * FROM symbols WHERE name=? OR qualified=? ORDER BY path,line,column LIMIT 51")
-      .all(selector,selector) as unknown as Symbol[];
-    if (matches.length > 1) throw new AmbiguousSymbolError(
-      `Ambiguous symbol '${selector}'. Select an id from search_code (IDs can change after edits):\n` +
-      matches.slice(0,50).map(s => `${s.qualified} (${s.path}:${s.line}) id=${s.id}`).join("\n") +
-      (matches.length > 50 ? "\nMore matches exist; narrow the search." : ""));
-    if (!matches.length && /^(?:heuristic|ts|lsp):/.test(selector)) throw new SymbolNotFoundError(
-      `Symbol ID '${selector}' is not present in the current graph. Copy a complete current id from search_code or graph_context; IDs can change after edits.`);
-    return matches[0];
+  /** Exactly one definition, or an error that lists the choices. */
+  one(selector: string): Sym {
+    const found = this.find(selector, 21);
+    if (!found.length) throw new SymbolNotFoundError(`No symbol matches '${selector}'. Use search_code to find its ID.`);
+    if (found.length > 1) throw new AmbiguousSymbolError(`'${selector}' matches ${found.length > 20 ? "more than 20" : found.length} definitions. Pass one of these IDs:\n` +
+      found.slice(0, 20).map(s => `  ${s.id}  (${s.kind}, line ${s.line})`).join("\n"));
+    return found[0]!;
+  }
+  symbol(id: string): Sym | undefined { return this.db.prepare("SELECT * FROM symbols WHERE id=?").get(id) as unknown as Sym | undefined; }
+
+  private edges(rows: CallRow[]): Edge[] {
+    const candidates = this.db.prepare("SELECT target_id FROM candidates WHERE call_id=? ORDER BY target_id");
+    return rows.map(r => ({ path: r.path, line: r.line, name: r.name, recv: r.recv, status: r.status, via: r.via, caller_id: r.caller_id,
+      callee_id: r.target_id, candidate_count: r.candidates,
+      candidates: r.status === "ambiguous" ? (candidates.all(r.id) as { target_id: string }[]).map(c => c.target_id) : [] }));
   }
 
-  whoCalls(name: string, limit = 30): Edge[] {
-    const symbol = this.selectSymbol(name);
-    if (!symbol) return [];
-    return this.db.prepare(`SELECT * FROM edges WHERE callee_id=? OR (status='heuristic' AND callee=?)
-      ORDER BY path,line LIMIT ?`).all(symbol.id,symbol.name,bounded(limit,100)) as unknown as Edge[];
+  /**
+   * Call sites that reach this definition. Non-test code comes first, then tests; within each,
+   * resolved, then inferred, then possible (ambiguous) — so a cut-off list never hides the one
+   * production caller behind dozens of test calls.
+   */
+  whoCalls(id: string, limit = 30): Edge[] {
+    const sure = this.db.prepare(`SELECT * FROM calls WHERE target_id=? AND ${EDGE} LIMIT 5000`).all(id) as unknown as CallRow[];
+    const maybe = this.db.prepare("SELECT c.* FROM candidates k JOIN calls c ON c.id=k.call_id WHERE k.target_id=? LIMIT 5000").all(id) as unknown as CallRow[];
+    const rank = (r: CallRow) => (TEST_PATH.test(r.path) ? 3 : 0) + (r.status === "resolved" ? 0 : r.status === "inferred" ? 1 : 2);
+    const rows = [...sure, ...maybe].sort((a, b) => rank(a) - rank(b) || (a.path < b.path ? -1 : a.path > b.path ? 1 : a.line - b.line || a.id - b.id));
+    return this.edges(rows.slice(0, bounded(limit, 30, 500)));
   }
 
-  callsFrom(name: string, limit = 30): Edge[] {
-    const symbol = this.selectSymbol(name);
-    if (!symbol) return [];
-    return this.db.prepare("SELECT * FROM edges WHERE caller_id=? ORDER BY line,callee LIMIT ?")
-      .all(symbol.id,bounded(limit,100)) as unknown as Edge[];
+  /** How many call sites whoCalls() has for this definition, by kind. */
+  callerCounts(id: string): { total: number; resolved: number; inferred: number; ambiguous: number; outsideTests: number } {
+    const rows = [...this.db.prepare(`SELECT path,status FROM calls WHERE target_id=? AND ${EDGE}`).all(id) as { path: string; status: Status }[],
+      ...this.db.prepare("SELECT c.path, c.status FROM candidates k JOIN calls c ON c.id=k.call_id WHERE k.target_id=?").all(id) as { path: string; status: Status }[]];
+    const count = (status: Status) => rows.filter(r => r.status === status).length;
+    return { total: rows.length, resolved: count("resolved"), inferred: count("inferred"), ambiguous: count("ambiguous"), outsideTests: rows.filter(r => !TEST_PATH.test(r.path)).length };
   }
 
-  /** Include unresolved/indirect references, so absence of an edge is not hidden. */
-  referencesFrom(name: string, limit = 30): Edge[] {
-    const symbol = this.selectSymbol(name);
-    if (!symbol) return [];
-    return this.db.prepare(`SELECT r.caller,r.callee,r.path,r.line,r.caller_id,s.id AS callee_id,
-      s.path AS callee_path,s.line AS callee_line,r.status,r.dispatch FROM call_refs r
-      LEFT JOIN symbols s ON s.id=r.target_id WHERE r.caller_id=? ORDER BY r.position LIMIT ?`)
-      .all(symbol.id,bounded(limit,100)) as unknown as Edge[];
+  /** Calls made inside this definition (for a class: inside any of its members). */
+  callsFrom(id: string, limit = 40): Edge[] {
+    return this.edges(this.db.prepare(`SELECT * FROM calls WHERE (caller_id=? OR caller_id LIKE ? ESCAPE '\\') AND ${LINKED} ORDER BY path, line, id LIMIT ?`)
+      .all(id, `${escapeLike(id)}.%`, bounded(limit, 40, 200)) as unknown as CallRow[]);
   }
 
-  coverage(): string { return this.meta("coverage") ?? "Index has not been built."; }
-
-  /** Task-local navigation context; ranks existing facts without running analysis. */
-  taskContext(query: string, options: ContextOptions = {}): TaskContext {
-    this.checkCancelled();
-    return this.taskIndex.retrieve(query, options, Number(this.meta("generation") ?? 0), this.isBuilt());
+  /** Every call site recorded in a file, including unresolved and external ones. */
+  callsIn(file: string): Edge[] {
+    return this.edges(this.db.prepare("SELECT * FROM calls WHERE path=? ORDER BY line, id").all(file) as unknown as CallRow[]);
   }
 
-  /** Compatibility wrapper. Only exact compiler bindings may compose a path. */
-  tracePath(from: string, to: string, maxDepth = 12): string[] | undefined {
-    const result = this.trace(from,to,maxDepth);
-    return result.status === "found" ? result.nodes.map(s => s.name) : undefined;
-  }
-
-  /** Bounded static-binding navigation; member bindings do not prove runtime dispatch. */
+  /**
+   * Shortest chain of calls from one definition to another. Resolved calls are
+   * tried first; name-only (inferred) calls are followed only if that finds nothing.
+   */
   trace(from: string, to: string, maxDepth = 12): TraceResult {
-    const base = { nodes: [] as Symbol[], hops: [] as Edge[], generation: Number(this.meta("generation") ?? 0) };
-    const start = this.selectSymbol(from), goal = this.selectSymbol(to);
-    if (!start || !goal) return { ...base,status:"not_found",reason:"An endpoint is not indexed; search for its current ID." };
-    if (!hasBindings(start) || !hasBindings(goal)) return { ...base,status:"unavailable",reason:this.coverage() };
-    if (start.id === goal.id) return { ...base,status:"found",nodes:[start] };
-    const next = this.db.prepare("SELECT * FROM edges WHERE caller_id=? AND status='resolved' AND callee_id IS NOT NULL ORDER BY line,callee_id LIMIT 10001");
-    const previous = new Map<string, Edge>(), seen = new Set([start.id]);
+    const start = this.one(from), goal = this.one(to);
+    if (start.id === goal.id) return { status: "found", nodes: [start], hops: [] };
+    const strict = this.searchPath(start, goal, maxDepth, "status='resolved'");
+    return strict.status === "found" ? strict : this.searchPath(start, goal, maxDepth, EDGE);
+  }
+  private searchPath(start: Sym, goal: Sym, maxDepth: number, statuses: string): TraceResult {
+    // The starting definition includes its members (trace from a class); later hops are exact.
+    const next = this.db.prepare(`SELECT * FROM calls WHERE (caller_id=? OR caller_id LIKE ? ESCAPE '\\') AND ${LINKED} AND ${statuses} ORDER BY line, id`);
+    const within = (node: string) => node === start.id ? `${escapeLike(node)}.%` : node;
+    const previous = new Map<string, { hop: CallRow; from: string }>(), seen = new Set([start.id]);
     let frontier = [start.id], examined = 0;
-    const deadline = performance.now() + 100, depthLimit = bounded(maxDepth,64);
+    const depthLimit = bounded(maxDepth, 12, 64);
     for (let depth = 0; depth < depthLimit && frontier.length; depth++) {
       const upcoming: string[] = [];
-      for (const node of frontier) {
-        for (const edge of next.all(node) as unknown as Edge[]) {
-          if (++examined > 10000 || seen.size > 2000 || performance.now() > deadline) return { ...base,status:"incomplete",reason:"Traversal budget reached (2,000 nodes / 10,000 edges / 100ms)." };
-          const id = edge.callee_id!;
-          if (seen.has(id)) continue;
-          previous.set(id,edge); seen.add(id);
-          if (id === goal.id) {
-            const hops: Edge[] = []; let cur = id;
-            while (cur !== start.id) { const hop = previous.get(cur)!; hops.unshift(hop); cur = hop.caller_id; }
-            const get = this.db.prepare("SELECT * FROM symbols WHERE id=?");
-            const nodes = [start,...hops.map(h => get.get(h.callee_id!) as unknown as Symbol)];
-            return { ...base,status:"found",nodes,hops,reason:"Static bindings only; runtime execution and member dispatch are not proven." };
-          }
-          upcoming.push(id);
+      for (const node of frontier) for (const hop of next.all(node, within(node)) as unknown as CallRow[]) {
+        if (++examined > 50_000 || seen.size > 10_000) return { status: "incomplete", nodes: [], hops: [], reason: "Search budget reached (10,000 symbols / 50,000 calls)." };
+        const id = hop.target_id!;
+        if (seen.has(id)) continue;
+        seen.add(id); previous.set(id, { hop, from: node });
+        if (id === goal.id) {
+          const hops: CallRow[] = [];
+          for (let cur = id; cur !== start.id; cur = previous.get(cur)!.from) hops.unshift(previous.get(cur)!.hop);
+          return { status: "found", nodes: [start, ...hops.map(h => this.symbol(h.target_id!)!)], hops: this.edges(hops) };
         }
+        upcoming.push(id);
       }
       frontier = upcoming;
     }
-    return { ...base,status:frontier.length ? "incomplete" : "not_found",reason:frontier.length
-      ? "Depth limit reached." : "No resolved static-binding path. Dynamic, contract, cross-project and unresolved references are not traversed." };
+    return { status: frontier.length ? "incomplete" : "not_found", nodes: [], hops: [],
+      reason: frontier.length ? `No path within ${depthLimit} calls.` : "No chain of resolved calls connects them. Ambiguous, dynamic and external calls are not followed." };
   }
 
-  /** Call tree from one exact symbol, cycle-safe and bounded for `faber map`. */
+  /** Indented call tree from one definition; cycle-safe and bounded. */
   callTree(entry: string, maxDepth = 4): string {
-    const root = this.selectSymbol(entry);
-    if (!root) return `No symbol matched ${entry}.`;
-    if (!hasBindings(root)) return `Call tree unavailable. ${this.coverage()}`;
-    const out = ["Static binding tree; runtime execution and member dispatch are not proven."], seen = new Set<string>();
-    const next = this.db.prepare(`SELECT s.* FROM edges e JOIN symbols s ON s.id=e.callee_id
-      WHERE e.caller_id=? AND e.status='resolved' GROUP BY s.id ORDER BY MIN(e.line),s.id LIMIT 16`);
-    const visit = (symbol: Symbol, depth: number): void => {
+    const root = this.one(entry);
+    const out: string[] = [], seen = new Set<string>(), depthLimit = bounded(maxDepth, 4, 12);
+    const next = this.db.prepare(`SELECT s.*, MIN(c.line) AS first FROM calls c JOIN symbols s ON s.id=c.target_id
+      WHERE (c.caller_id=? OR c.caller_id LIKE ? ESCAPE '\\') AND c.${LINKED} AND c.${EDGE} GROUP BY s.id ORDER BY first, s.id LIMIT 16`);
+    const visit = (s: Sym, depth: number): void => {
       if (out.length >= 200) return;
-      out.push(`${"  ".repeat(depth)}${symbol.qualified} (${symbol.path}:${symbol.line})${seen.has(symbol.id) ? " ↩ (seen)" : ""}`);
-      if (seen.has(symbol.id) || depth >= bounded(maxDepth,12)) return;
-      seen.add(symbol.id);
-      const children = next.all(symbol.id) as unknown as Symbol[];
-      for (const child of children.slice(0,15)) visit(child,depth+1);
-      if (children.length > 15 && out.length < 200) out.push(`${"  ".repeat(depth+1)}… more calls omitted`);
+      const again = seen.has(s.id);
+      out.push(`${"  ".repeat(depth)}${s.qualified} (${s.path}:${s.line})${again ? " ↩" : ""}`);
+      if (again || depth >= depthLimit) return;
+      seen.add(s.id);
+      const children = next.all(s.id, s.id === root.id ? `${escapeLike(s.id)}.%` : s.id) as unknown as Sym[];
+      for (const child of children.slice(0, 15)) if (child.id !== s.id) visit(child, depth + 1);
+      if (children.length > 15 && out.length < 200) out.push(`${"  ".repeat(depth + 1)}… more calls omitted`);
     };
-    visit(root,0);
+    visit(root, 0);
     if (out.length >= 200) out.push("… tree truncated at 200 lines");
     return out.join("\n");
   }
 
-  /** One row per display name; degrees are aggregated navigation hints. */
+  /** The most-called definitions, one line each, counted per definition (not per name), resolved calls only. */
   repoMap(limit = 15): string {
-    const rows = this.db.prepare(`SELECT s.name,MIN(s.kind) AS kind,MIN(s.path) AS path,
-      COUNT(*) AS definitions,COUNT(DISTINCT s.path) AS file_count,
-      (SELECT COUNT(*) FROM edges e WHERE e.callee=s.name) +
-      (SELECT COUNT(*) FROM edges e WHERE e.caller=s.name) AS degree
-      FROM symbols s WHERE s.kind NOT IN ('module','initializer') GROUP BY s.name
-      ORDER BY degree DESC,s.name LIMIT ?`).all(bounded(limit,100)) as any[];
-    return rows.filter(r => r.degree > 0).map(r => `${r.name} [${r.kind}] ${r.file_count > 1
-      ? `${r.file_count} files (ambiguous)` : `${r.path}${r.definitions > 1 ? " (ambiguous)" : ""}`} (${r.degree} connections)`).join("\n");
+    const rows = this.db.prepare(`SELECT s.*, COUNT(*) AS callers FROM calls c JOIN symbols s ON s.id=c.target_id
+      WHERE c.status='resolved' GROUP BY s.id ORDER BY callers DESC, s.id LIMIT ?`).all(bounded(limit, 15, 100)) as unknown as (Sym & { callers: number })[];
+    return rows.map(r => `${r.qualified} [${r.kind}] ${r.path}:${r.line} (${r.callers} call${r.callers === 1 ? "" : "s"})`).join("\n");
   }
 
-  isBuilt(): boolean { return this.meta("built_at") != null; }
-  close(): void { if (this.closed) return; this.closed = true; this.languages?.close(); this.compiler?.close(); this.db.close(); }
-}
-
-function hasBindings(symbol: Symbol): boolean { return symbol.provider === "typescript" || symbol.provider.startsWith("lsp:"); }
-
-function bounded(value: number, max: number): number { return Number.isFinite(value) ? Math.max(0,Math.min(max,Math.floor(value))) : max; }
-function hashText(text: string): string { return createHash("sha256").update(text).digest("hex"); }
-function diskStamp(file: string): string {
-  try { const s = fs.statSync(file); return s.isDirectory() ? "directory" : `${s.mtimeMs}:${s.ctimeMs}:${s.size}`; }
-  catch (error) { if (["ENOENT","ENOTDIR"].includes((error as NodeJS.ErrnoException).code ?? "")) return "missing"; throw error; }
-}
-function inputStamp(file: string, previous: string): string {
-  const stamp = diskStamp(file);
-  return stamp === "directory" && previous.startsWith("entries:") ? `entries:${hashText(fs.readdirSync(file).sort().join("\0"))}` : stamp;
-}
-function projectTypeScript(workspace: string, selected?: string | false): string | undefined {
-  if (selected === false) return undefined;
-  try {
-    const require = createRequire(path.join(workspace,"package.json"));
-    const file = require.resolve(selected ?? "typescript"), ts = require(file) as typeof TS;
-    const [major, minor] = ts.version.split(".").map(Number);
-    if (major === 5 && minor! >= 6 && typeof ts.createLanguageService === "function") return file;
-    if (selected) throw new Error(`Unsupported TypeScript ${ts.version}; expected 5.6 or newer within 5.x.`);
-  } catch (error) { if (selected) throw new Error(`Cannot load graph compiler: ${String(error)}`); }
-  return undefined;
-}
-
-/** Retain cheap, explicitly heuristic navigation where semantic analysis is unavailable. */
-function heuristicFacts(text: string, rel: string): FileFacts {
-  const ext = path.extname(rel), originals = text.split("\n"), lines = codeForIndexing(text,ext).split("\n");
-  const facts: FileFacts = { symbols:[],refs:[],imports:[] }, fileKey = hashText(rel).slice(0,32);
-  for (let i=0;i<lines.length;i++) for (const [kind,rx] of LANG[ext] ?? []) {
-    const match = rx.exec(lines[i]!);
-    if (match?.[1] && !CALL_KEYWORDS.has(match[1]) && !isLanguageKeyword(match[1],ext)) {
-      const name = match[1];
-      facts.symbols.push({name,kind,path:rel,line:i+1,signature:originals[i]!.trim().slice(0,120),
-        id:`heuristic:${fileKey}:${name}@${i+1}`,qualified:name,end_line:i+1,column:1,provider:"heuristic"});
-      break;
+  /**
+   * Task-specific context: definitions whose names, paths or signatures match the
+   * task's words, plus their direct callers and callees, within a token budget.
+   */
+  context(query: string, tokenBudget = 1500): string {
+    const budget = bounded(tokenBudget, 1500, 8000) * 3;
+    const words = searchTerms(query.slice(0, 4000)).filter(w => w.length > 1 && !STOP_WORDS.has(w)).slice(0, 16);
+    if (!words.length || !budget || !this.isBuilt()) return "";
+    const literal = new Set((query.match(/[\w$]+(?:[./#:-][\w$]+)*/g) ?? []).map(s => s.toLowerCase()));
+    let rows: Sym[];
+    if (this.fts) {
+      rows = this.db.prepare(`SELECT s.* FROM symbols_fts JOIN symbols s ON s.rowid=symbols_fts.rowid WHERE symbols_fts MATCH ?
+        ORDER BY bm25(symbols_fts,10,8,4), s.id LIMIT 200`).all(words.map(w => `"${w.replace(/"/g, '""')}"*`).join(" OR ")) as unknown as Sym[];
+    } else {
+      const clause = words.map(() => "(name LIKE ? OR path LIKE ?)").join(" OR ");
+      rows = this.db.prepare(`SELECT * FROM symbols WHERE kind!='namespace' AND (${clause}) ORDER BY id LIMIT 200`)
+        .all(...words.flatMap(w => [`%${w}%`, `%${w}%`])) as unknown as Sym[];
     }
-  }
-  const definitions = new Map<number, Set<string>>();
-  for (const s of facts.symbols) { if (!definitions.has(s.line)) definitions.set(s.line,new Set()); definitions.get(s.line)!.add(s.name); }
-  let cursor = 0, offset = 0;
-  let caller = "<module>", callerId = `heuristic:${fileKey}::<module>`;
-  for (let i=0;i<lines.length;i++) {
-    while (cursor < facts.symbols.length && facts.symbols[cursor]!.line <= i+1) {
-      const s = facts.symbols[cursor++]!; caller=s.name; callerId=s.id;
-    }
-    const line = lines[i]!;
-    for (const rx of IMPORT_RX[ext] ?? (JS_EXTENSIONS.has(ext) ? IMPORT_RX[".js"]! : [])) {
-      const m = rx.exec(line); if (m?.[1]) facts.imports.push({target:m[1],line:i+1});
-    }
-    CALL_RX.lastIndex=0; let m: RegExpExecArray | null;
-    while ((m=CALL_RX.exec(line))) {
-      const callee=m[1]!;
-      if (CALL_KEYWORDS.has(callee) || isLanguageKeyword(callee,ext) || definitions.get(i+1)?.has(callee) || caller===callee) continue;
-      facts.refs.push({caller,callee,path:rel,line:i+1,id:`${fileKey}@${offset+m.index}`,caller_id:callerId,
-        target_id:null,status:"heuristic",dispatch:"unknown",position:offset+m.index});
-    }
-    offset += line.length+1;
-  }
-  return facts;
-}
-
-/** Optional, project-local compiler. No mandatory runtime dependency or installation. */
-class TypeScriptGraph {
-  private ts: typeof TS;
-  private registry: TS.DocumentRegistry;
-  private services = new Map<string, { service: TS.LanguageService; roots: string[]; options: TS.CompilerOptions; version: number; references?: readonly TS.ProjectReference[] }>();
-  private snapshots = new Map<string, { stamp: string; snapshot: TS.IScriptSnapshot }>();
-  private dependencies = new Map<string, Set<string>>();
-  private dependents = new Map<string, Set<string>>();
-  private globals = new Set<string>();
-  private resolveAll = true;
-  private resolutionChanges = new Set<string>();
-  readonly files = new Set<string>();
-  readonly inputs = new Map<string,string>();
-  description = "";
-
-  constructor(modulePath: string, private workspace: string, private checkCancelled: () => void = () => {}) {
-    this.ts = createRequire(import.meta.url)(modulePath) as typeof TS;
-    this.registry = this.ts.createDocumentRegistry(this.ts.sys.useCaseSensitiveFileNames,workspace);
-  }
-  close(): void {
-    for (const p of this.services.values()) p.service.dispose();
-    this.services.clear(); this.snapshots.clear();
-  }
-  private stamp(file: string): string {
-    this.checkCancelled();
-    file=path.resolve(file); const stamp=diskStamp(file); this.inputs.set(file,stamp); return stamp;
-  }
-  private read(file: string): string | undefined { this.stamp(file); return this.ts.sys.readFile(file); }
-
-  analyze(all: string[], changed: Set<string>, structural: boolean): Map<string,FileFacts> {
-    const ts = this.ts, candidates = all.filter(f => JS_EXTENSIONS.has(path.extname(f)));
-    const configAt = new Map<string,string>(), parsed = new Map<string,TS.ParsedCommandLine>();
-    const nearest = (dir: string): string => {
-      const cached = configAt.get(dir); if (cached !== undefined) return cached;
-      for (const name of ["tsconfig.json","jsconfig.json"]) {
-        const file=path.join(dir,name), stamp=this.stamp(file);
-        if (stamp !== "missing" && stamp !== "directory") { configAt.set(dir,file); return file; }
+    const score = (s: Sym): number => {
+      let value = 0;
+      if (literal.has(s.name.toLowerCase())) value += 60;
+      if (literal.has(s.qualified.toLowerCase())) value += 40;
+      if ([...literal].some(l => l.includes("/") && s.path.toLowerCase().endsWith(l))) value += 80;
+      for (const [text, weight] of [[s.name, 12], [s.qualified, 6], [s.path, 4]] as const) {
+        const terms = searchTerms(text);
+        value += words.filter(w => terms.some(t => t === w || t.startsWith(w))).length * weight;
       }
-      const parent=path.dirname(dir), key=dir===this.workspace || parent===dir ? "" : nearest(parent);
-      configAt.set(dir,key); return key;
+      return TEST_PATH.test(s.path) && !words.some(w => /^(?:test|spec|fixture)/.test(w)) ? value * 0.7 : value;
     };
-    const parse = (key: string): TS.ParsedCommandLine => {
-      const cached=parsed.get(key); if (cached) return cached;
-      const config=ts.readConfigFile(key,f=>this.read(f));
-      if (config.error) throw new Error(ts.flattenDiagnosticMessageText(config.error.messageText,"\n"));
-      const result=ts.parseJsonConfigFileContent(config.config,{
-        useCaseSensitiveFileNames:ts.sys.useCaseSensitiveFileNames,
-        readDirectory:ts.sys.readDirectory,
-        fileExists:f=>{const s=this.stamp(f);return s!=="missing" && s!=="directory";},
-        readFile:f=>this.read(f),
-      },path.dirname(key),undefined,key);
-      const errors=result.errors.filter(e=>e.code!==18003);
-      if (errors.length) throw new Error(`Graph configuration ${key}: ${errors.map(e=>ts.flattenDiagnosticMessageText(e.messageText,"\n")).join("; ")}`);
-      parsed.set(key,result); return result;
-    };
-    const projectFor=new Map<string,string>(), groups=new Map<string,string[]>();
-    for (const file of candidates) {
-      this.checkCancelled();
-      const key=nearest(path.dirname(file));
-      // Respect project exclusions instead of fabricating compiler options.
-      if (key && !parse(key).fileNames.some(f=>path.resolve(f)===file)) continue;
-      projectFor.set(file,key);
-      if (!groups.has(key)) groups.set(key,[]);
-      groups.get(key)!.push(file);
-    }
-    const eligible=new Set(projectFor.keys());
-    let full=!this.files.size || structural || [...changed].some(f=>this.globals.has(f) || f.endsWith(".d.ts"));
-    if (!full) for (const file of changed) if (eligible.has(file)) {
-      const sf=ts.createSourceFile(file,this.read(file)!,ts.ScriptTarget.Latest,true);
-      if (!ts.isExternalModule(sf) || sf.statements.some(n=>ts.isModuleDeclaration(n) && !!(n.flags & ts.NodeFlags.GlobalAugmentation))) {full=true;break;}
-    }
-    const affected=new Set(full ? eligible : changed), pending=[...affected];
-    for (let i=0;i<pending.length;i++) for (const importer of this.dependents.get(pending[i]!) ?? []) {
-      if (!affected.has(importer)) {affected.add(importer);pending.push(importer);}
-    }
-    this.resolveAll=full;this.resolutionChanges=changed;
-    this.files.clear();for (const file of eligible) this.files.add(file);
-    const facts=new Map<string,FileFacts>();
-    for (const [key,roots] of groups) {
-      this.checkCancelled();
-      let state=this.services.get(key);
-      if (state && !roots.some(f=>affected.has(f))) continue;
-      const options: TS.CompilerOptions={...(key ? parse(key).options : {
-        target:ts.ScriptTarget.ES2022,module:ts.ModuleKind.NodeNext,moduleResolution:ts.ModuleResolutionKind.NodeNext,allowJs:true,jsx:ts.JsxEmit.Preserve,
-      }),noEmit:true,disableSizeLimit:true};
-      if (!state) {
-        const current={roots,options,version:0,references:key ? parse(key).projectReferences : undefined,service:undefined as unknown as TS.LanguageService};
-        const host: TS.LanguageServiceHost & { hasInvalidatedResolutions(file: string): boolean }={
-          getScriptFileNames:()=>current.roots,
-          getScriptVersion:file=>this.stamp(file),
-          getProjectVersion:()=>String(current.version),
-          getCompilationSettings:()=>current.options,
-          getProjectReferences:()=>current.references,
-          getCurrentDirectory:()=>key ? path.dirname(key) : this.workspace,
-          getDefaultLibFileName:o=>ts.getDefaultLibFilePath(o),
-          getScriptSnapshot:file=>{
-            file=path.resolve(file);const stamp=this.stamp(file);
-            if (stamp==="missing" || stamp==="directory") return undefined;
-            let cached=this.snapshots.get(file);
-            if (!cached || cached.stamp!==stamp) {
-              const text=this.read(file);if (text===undefined) return undefined;
-              cached={stamp,snapshot:ts.ScriptSnapshot.fromString(text)};this.snapshots.set(file,cached);
-            }
-            return cached.snapshot;
-          },
-          fileExists:file=>{const s=this.stamp(file);return s!=="missing" && s!=="directory";},
-          readFile:file=>this.read(file),
-          directoryExists:dir=>{this.stamp(dir);return ts.sys.directoryExists(dir);},
-          getDirectories:dir=>{this.inputs.set(path.resolve(dir),inputStamp(dir,"entries:"));return ts.sys.getDirectories(dir);},
-          readDirectory:ts.sys.readDirectory,realpath:ts.sys.realpath,
-          useCaseSensitiveFileNames:()=>ts.sys.useCaseSensitiveFileNames,
-          hasInvalidatedResolutions:file=>this.resolveAll || this.resolutionChanges.has(path.resolve(file)),
-        };
-        current.service=ts.createLanguageService(host,this.registry);state=current;this.services.set(key,state);
-      }
-      state.roots=roots;state.options=options;state.version++;
-      const program=state.service.getProgram();
-      if (!program) throw new Error("TypeScript graph program is unavailable.");
-      const checker=program.getTypeChecker();
-      for (const file of roots) {
-        this.checkCancelled();
-        if (!affected.has(file)) continue;
-        const sf=program.getSourceFile(file);if (!sf) throw new Error(`Compiler omitted graph source: ${file}`);
-        const deps=new Set<string>();
-        const f=this.extract(sf,checker,eligible,projectFor,key,deps);
-        facts.set(file,f);
-        for (const dep of this.dependencies.get(file) ?? []) this.dependents.get(dep)?.delete(file);
-        this.dependencies.set(file,deps);
-        for (const dep of deps) {if (!this.dependents.has(dep)) this.dependents.set(dep,new Set());this.dependents.get(dep)!.add(file);}
-        if (!ts.isExternalModule(sf) || sf.statements.some(n=>ts.isModuleDeclaration(n) && !!(n.flags & ts.NodeFlags.GlobalAugmentation))) this.globals.add(file);
-        else this.globals.delete(file);
+    const ranked = new Map(rows.map(s => [s.id, { symbol: s, score: score(s), why: "" }]));
+    const seeds = [...ranked.values()].sort((a, b) => b.score - a.score || (a.symbol.id < b.symbol.id ? -1 : 1)).slice(0, 6);
+    const out = this.db.prepare(`SELECT DISTINCT target_id AS id FROM calls WHERE caller_id=? AND ${LINKED} AND ${EDGE} LIMIT 12`);
+    const into = this.db.prepare(`SELECT DISTINCT caller_id AS id FROM calls WHERE target_id=? AND ${EDGE} AND caller_id!='' LIMIT 12`);
+    for (const seed of seeds) for (const [statement, label] of [[out, "called by"], [into, "calls"]] as const) {
+      for (const { id } of statement.all(seed.symbol.id) as { id: string }[]) {
+        const neighbor = ranked.get(id)?.symbol ?? this.symbol(id);
+        if (!neighbor || neighbor.id === seed.symbol.id) continue;
+        const value = score(neighbor) + seed.score * 0.3, existing = ranked.get(id);
+        if (!existing || value > existing.score) ranked.set(id, { symbol: neighbor, score: value, why: `${label} ${seed.symbol.qualified}` });
       }
     }
-    for (const [key,value] of this.services) if (!groups.has(key)) {value.service.dispose();this.services.delete(key);}
-    for (const file of this.dependencies.keys()) if (!eligible.has(file)) {
-      for (const dep of this.dependencies.get(file)!) this.dependents.get(dep)?.delete(file);
-      this.dependencies.delete(file);this.globals.delete(file);this.snapshots.delete(file);
+    const header = "Relevant definitions from the code graph (static hints; read the source to confirm behavior):\n";
+    let text = header; const perFile = new Map<string, number>(); let shown = 0;
+    for (const item of [...ranked.values()].sort((a, b) => b.score - a.score || (a.symbol.id < b.symbol.id ? -1 : 1))) {
+      const s = item.symbol, count = perFile.get(s.path) ?? 0;
+      if (count >= 4 || shown >= 24) continue;
+      const line = `${s.id}  [${s.kind}] line ${s.line}${item.why ? `  (${item.why})` : ""}\n    ${s.signature}\n`;
+      if (Buffer.byteLength(text + line) > budget) break;
+      text += line; perFile.set(s.path, count + 1); shown++;
     }
-    this.description=`TypeScript ${ts.version}: ${eligible.size} files in ${groups.size} projects; ${all.length-eligible.size} heuristic files. Static bindings only; runtime/member dispatch is not proven.`;
-    return facts;
+    return shown ? text : "";
   }
 
-  private extract(sf: TS.SourceFile, checker: TS.TypeChecker, eligible: Set<string>, projects: Map<string,string>, context: string, deps: Set<string>): FileFacts {
-    const ts=this.ts, file=path.resolve(sf.fileName), rel=path.relative(this.workspace,file);
-    const result:FileFacts={symbols:[],refs:[],imports:[]};
-    const callable=(n:TS.Node): n is TS.FunctionDeclaration | TS.FunctionExpression | TS.ArrowFunction | TS.MethodDeclaration | TS.GetAccessorDeclaration | TS.SetAccessorDeclaration | TS.ConstructorDeclaration =>
-      ts.isFunctionDeclaration(n)||ts.isFunctionExpression(n)||ts.isArrowFunction(n)||ts.isMethodDeclaration(n)||ts.isGetAccessor(n)||ts.isSetAccessor(n)||ts.isConstructorDeclaration(n);
-    const normalize=(n:TS.Node):TS.Node=>{
-      if ((ts.isVariableDeclaration(n)||ts.isPropertyDeclaration(n)||ts.isPropertyAssignment(n)) && n.initializer && callable(n.initializer)) return n.initializer;
-      return n;
-    };
-    const label=(n:TS.Node):string=>{
-      if (ts.isConstructorDeclaration(n)) return "constructor";
-      if ((ts.isArrowFunction(n)||ts.isFunctionExpression(n)) && (ts.isVariableDeclaration(n.parent)||ts.isPropertyDeclaration(n.parent)||ts.isPropertyAssignment(n.parent))) return n.parent.name.getText();
-      const name=(n as TS.NamedDeclaration).name;
-      if (name && (ts.isIdentifier(name)||ts.isPrivateIdentifier(name)||ts.isStringLiteral(name)||ts.isNumericLiteral(name))) return name.text;
-      return `<${ts.SyntaxKind[n.kind]}@${n.getStart()}>`;
-    };
-    const cache=new WeakMap<TS.Node,Symbol>();
-    const describe=(raw:TS.Node):Symbol|undefined=>{
-      const node=normalize(raw), previous=cache.get(node);if (previous) return previous;
-      const source=node.getSourceFile(), abs=path.resolve(source.fileName);if (!eligible.has(abs)) return undefined;
-      const start=node.getStart(source), location=source.getLineAndCharacterOfPosition(start), parts=[label(node)];
-      for (let parent=node.parent;parent && !ts.isSourceFile(parent);parent=parent.parent) {
-        if (callable(parent)||ts.isClassDeclaration(parent)||ts.isClassExpression(parent)||ts.isInterfaceDeclaration(parent)||ts.isModuleDeclaration(parent)) parts.unshift(label(parent));
-        else if (ts.isBlock(parent) && !(callable(parent.parent) && parent.parent.body===parent)) parts.unshift(`<block@${parent.getStart(source)}>`);
-      }
-      const qualified=parts.join("."), relative=path.relative(this.workspace,abs), project=projects.get(abs)!;
-      const kind=ts.isClassDeclaration(node)||ts.isClassExpression(node)?"class":ts.isInterfaceDeclaration(node)?"interface":ts.isTypeAliasDeclaration(node)?"type":ts.isEnumDeclaration(node)?"enum":
-        ts.isMethodDeclaration(node)||ts.isMethodSignature(node)||ts.isGetAccessor(node)||ts.isSetAccessor(node)||ts.isConstructorDeclaration(node)?"method":callable(node)?"function":"initializer";
-      const value:Symbol={name:label(node),kind,path:relative,line:location.line+1,signature:source.text.slice(start).split("\n",1)[0]!.trim().slice(0,120),
-        id:`ts:${hashText(JSON.stringify([project ? path.relative(this.workspace,project) : "<inferred>",relative,qualified,start])).slice(0,32)}`,
-        qualified,end_line:source.getLineAndCharacterOfPosition(node.end).line+1,column:location.character+1,provider:"typescript"};
-      cache.set(node,value);return value;
-    };
-    const project=context ? path.relative(this.workspace,context) : "<inferred>";
-    const module:Symbol={name:"<module>",qualified:"<module>",kind:"module",path:rel,line:1,column:1,end_line:sf.getLineAndCharacterOfPosition(sf.end).line+1,
-      signature:"<module>",provider:"typescript",id:`ts:${hashText(JSON.stringify([project,rel,"<module>"])).slice(0,32)}`};
-    result.symbols.push(module);
-    const added=new Set([module.id]);
-    const add=(s:Symbol|undefined):void=>{if (s && !added.has(s.id) && s.name!=="extends" && s.name!=="implements") {added.add(s.id);result.symbols.push(s);}};
-    const dependency=(n:TS.Node):void=>{const target=path.resolve(n.getSourceFile().fileName);if(target!==file)deps.add(target);};
-    const moduleReference=(node:TS.Node,target:string):void=>{
-      result.imports.push({target,line:sf.getLineAndCharacterOfPosition(node.getStart(sf)).line+1});
-      const symbol=checker.getSymbolAtLocation(node);
-      for (const d of symbol?.declarations ?? []) dependency(d);
-    };
-    const broken=(sf as TS.SourceFile & {parseDiagnostics?:readonly TS.Diagnostic[]}).parseDiagnostics?.length;
-    const visit=(node:TS.Node,owner:Symbol):void=>{
-      this.checkCancelled();
-      const outerOwner=owner;
-      if ((callable(node) && !!node.body)||ts.isClassDeclaration(node)||ts.isClassExpression(node)||ts.isInterfaceDeclaration(node)||ts.isTypeAliasDeclaration(node)||ts.isEnumDeclaration(node)||ts.isMethodSignature(node)||(ts.isFunctionDeclaration(node)&&sf.isDeclarationFile)) {
-        const symbol=describe(node);add(symbol);if (callable(node)&&node.body&&symbol) owner=symbol;
-      }
-      // Initializers execute in a different context from a constructor/method body.
-      if (ts.isDecorator(node)||ts.isClassStaticBlockDeclaration(node)||
-          (ts.isPropertyDeclaration(node)&&node.initializer&&!callable(node.initializer))) {
-        const symbol=describe(node);if (symbol) {symbol.kind="initializer";add(symbol);owner=symbol;}
-      }
-      if ((ts.isImportDeclaration(node)||ts.isExportDeclaration(node))&&node.moduleSpecifier&&ts.isStringLiteralLike(node.moduleSpecifier)) moduleReference(node.moduleSpecifier,node.moduleSpecifier.text);
-      if (ts.isImportEqualsDeclaration(node)&&ts.isExternalModuleReference(node.moduleReference)&&node.moduleReference.expression&&ts.isStringLiteralLike(node.moduleReference.expression)) moduleReference(node.moduleReference.expression,node.moduleReference.expression.text);
-      if (ts.isImportTypeNode(node)&&ts.isLiteralTypeNode(node.argument)&&ts.isStringLiteralLike(node.argument.literal)) moduleReference(node.argument.literal,node.argument.literal.text);
-      if (ts.isCallExpression(node)||ts.isNewExpression(node)) {
-        let expression: TS.Expression=node.expression;
-        while (ts.isParenthesizedExpression(expression)||ts.isNonNullExpression(expression)||ts.isAsExpression(expression)||ts.isTypeAssertionExpression(expression)) expression=expression.expression;
-        if (ts.isCallExpression(node)&&node.arguments[0]&&ts.isStringLiteralLike(node.arguments[0])&&
-            (expression.kind===ts.SyntaxKind.ImportKeyword||(ts.isIdentifier(expression)&&expression.text==="require"))) moduleReference(node.arguments[0],node.arguments[0].text);
-        let binding=checker.getSymbolAtLocation(ts.isPropertyAccessExpression(expression)?expression.name:expression);
-        const seen=new Set<TS.Symbol>();
-        while (binding && (binding.flags&ts.SymbolFlags.Alias) && !seen.has(binding)) {seen.add(binding);binding=checker.getAliasedSymbol(binding);}
-        let declarations=(binding?.declarations ?? []).map(normalize);
-        if (callable(expression)) declarations=[expression];
-        for (const declaration of declarations) dependency(declaration);
-        if (ts.isNewExpression(node)&&declarations.length===1&&(ts.isClassDeclaration(declarations[0]!)||ts.isClassExpression(declarations[0]!))) {
-          const constructors=(declarations[0] as TS.ClassLikeDeclaration).members.filter((m):m is TS.ConstructorDeclaration=>ts.isConstructorDeclaration(m)&&!!m.body);
-          if (constructors.length===1) declarations=constructors;
-        }
-        const bodies=declarations.filter(d=>callable(d)&&d.body);
-        if (bodies.length) declarations=bodies;
-        declarations=[...new Set(declarations)];
-        let status="unresolved",dispatch="unknown",target:Symbol|undefined;
-        if (!broken && declarations.length>1) status="ambiguous";
-        if (!broken && declarations.length===1) {
-          const declaration=declarations[0]!;
-          if (ts.isParameter(declaration)) {status="indirect";dispatch="callback";}
-          else if (callable(declaration)||ts.isMethodSignature(declaration)) {
-            target=describe(declaration);
-            status=target ? (callable(declaration)&&declaration.body ? "resolved" : "contract") : "external";
-            dispatch=ts.isMethodDeclaration(declaration)||ts.isMethodSignature(declaration)||ts.isGetAccessor(declaration)||ts.isSetAccessor(declaration)?"member":"direct";
-            if (ts.isArrowFunction(declaration)||ts.isFunctionExpression(declaration)) {
-              const parent=declaration.parent;
-              if (ts.isVariableDeclaration(parent)&&!(parent.parent.flags&ts.NodeFlags.Const)) {status="indirect";dispatch="mutable";}
-              if (ts.isPropertyDeclaration(parent)||ts.isPropertyAssignment(parent)) dispatch="member";
-            }
-            if (target && projects.get(path.resolve(declaration.getSourceFile().fileName))!==context) status="cross_project";
-          } else status=eligible.has(path.resolve(declaration.getSourceFile().fileName)) ? "indirect" : "external";
-        }
-        const position=node.getStart(sf);
-        const callee=ts.isPropertyAccessExpression(expression)?expression.name.text:ts.isIdentifier(expression)?expression.text:expression.getText(sf).slice(0,120);
-        result.refs.push({caller:owner.name,callee,path:rel,line:sf.getLineAndCharacterOfPosition(position).line+1,
-          id:`${hashText(rel).slice(0,32)}@${position}`,caller_id:owner.id,target_id:target?.id ?? null,status,dispatch,position});
-      }
-      ts.forEachChild(node,child=>visit(child,ts.isDecorator(child)||ts.isComputedPropertyName(child) ? outerOwner : owner));
-    };
-    visit(sf,module);
-    return result;
+  /** What the graph covers, in a few lines. */
+  coverage(): string {
+    if (!this.isBuilt()) return "Code graph has not been built.";
+    const langs = this.db.prepare("SELECT lang, provider, COUNT(*) AS n FROM files WHERE lang!='' GROUP BY lang, provider ORDER BY n DESC").all() as { lang: string; provider: string; n: number }[];
+    const status = new Map((this.db.prepare("SELECT status, COUNT(*) AS n FROM calls GROUP BY status").all() as { status: string; n: number }[]).map(r => [r.status, r.n]));
+    const n = (s: string) => status.get(s) ?? 0;
+    const lines = [
+      `Languages: ${langs.map(l => `${l.lang} ${l.n}${l.provider === "generic" ? " (generic scanner)" : ""}`).join(", ") || "none"}.`,
+      `Calls: ${n("resolved")} resolved, ${n("inferred")} inferred by unique name, ${n("ambiguous")} ambiguous, ${n("external")} external, ${n("unresolved")} unresolved.`,
+    ];
+    const skipped = Number(this.meta("skipped") ?? 0);
+    if (skipped) lines.push(`${skipped} files beyond the file limit were not indexed (FABER_GRAPH_MAX_FILES).`);
+    for (const [grammar, problem] of grammarProblems) lines.push(`Grammar ${grammar} unavailable, using the generic scanner: ${problem}`);
+    return lines.join("\n");
   }
 }
 
-/** Mask comments without shifting lines or mistaking quoted URLs for comments.
- * Multiline literals and templates are opaque and masked too, so their prose
- * cannot become definitions. Template interpolation is not parsed; JS regex
- * starts use expression-prefix heuristics. Ordinary quoted imports survive.
+/**
+ * One line per call site, for tool output. `about` names the definition the reply is already
+ * about, so it is not repeated on every line: "callee" for who_calls, "caller" for calls_from.
  */
-export function codeForIndexing(text: string, ext: string): string {
-  const hash = ext === ".py" || ext === ".rb" || ext === ".php";
-  const slash = ext !== ".py" && ext !== ".rb";
-  const js = JS_EXTENSIONS.has(ext);
-  const parts: string[] = [];
-  let copied = 0;
-  const mask = (start: number, end: number): void => {
-    parts.push(text.slice(copied, start), text.slice(start, end).replace(/[^\r\n]/g, " "));
-    copied = end;
-  };
-  for (let i = 0; i < text.length; i++) {
-    const c = text[i]!;
-    if (c === '"' || c === "'" || c === "`") {
-      const start = i;
-      const quote = ext === ".py" && text.slice(i, i + 3) === c.repeat(3) ? c.repeat(3) : c;
-      i += quote.length;
-      for (; i < text.length; i++) {
-        if (text[i] === "\\") { i++; continue; }
-        if (text.startsWith(quote, i)) { i += quote.length - 1; break; }
-        if (quote !== "`" && quote.length === 1 && text[i] === "\n") { i--; break; }
-      }
-      if (quote === "`" || quote.length === 3 || text.slice(start, i + 1).includes("\n")) {
-        mask(start, Math.min(i + 1, text.length));
-      }
-      continue;
-    }
-    const block = slash && c === "/" && text[i + 1] === "*";
-    const line = (slash && c === "/" && text[i + 1] === "/") || (hash && c === "#");
-    if (block || line) {
-      let end = block ? text.indexOf("*/", i + 2) : text.indexOf("\n", i);
-      end = end < 0 ? text.length : end + (block ? 2 : 0);
-      mask(i, end);
-      i = end - 1;
-    } else if (js && c === "/") {
-      // In a regex, even [/*] or [//] are literal character classes.
-      const prefix = text.slice(Math.max(0, i - 32), i).trimEnd();
-      if (!prefix || /[=(:,\[!&|?{};]$|\b(?:return|throw|yield|case|void|typeof|delete|in|of)$/.test(prefix)) {
-        let inClass = false;
-        for (let j = i + 1; j < text.length && text[j] !== "\n"; j++) {
-          if (text[j] === "\\") { j++; continue; }
-          if (text[j] === "[") inClass = true;
-          else if (text[j] === "]") inClass = false;
-          else if (text[j] === "/" && !inClass) { i = j; break; }
-        }
-      }
-    }
+export function formatEdge(edge: Edge, indexer: CodeIndexer, about?: "callee" | "caller"): string {
+  const caller = edge.caller_id ? indexer.symbol(edge.caller_id)?.qualified ?? edge.caller_id : "<module>";
+  const from = about === "caller" ? `line ${edge.line}  ${caller}` : `${edge.path}:${edge.line}  ${caller}`;
+  if (edge.status === "ambiguous") {
+    const more = edge.candidate_count > edge.candidates.length ? ` (+${edge.candidate_count - edge.candidates.length} more)` : "";
+    return `${from} → ${edge.name}()  [ambiguous: ${edge.candidates.join(" | ")}${more}]`;
   }
-  parts.push(text.slice(copied));
-  return parts.join("");
+  if (!edge.callee_id) return `${from} → ${edge.recv && edge.recv !== "?" ? edge.recv + "." : ""}${edge.name}()  [${edge.status}]`;
+  const why = edge.status === "inferred" ? "inferred: name match only" : edge.via;
+  return about === "callee" ? `${from}  [${why}]` : `${from} → ${edge.callee_id}  [${why}]`;
 }
-
-export function isAnalysisControl(file: string): boolean {
-  return /^(?:tsconfig.*\.json|jsconfig.*\.json|package\.json|.*lock.*|pyproject\.toml|pyrightconfig\.json|setup\.(?:cfg|py)|requirements.*\.txt|pom\.xml|.*\.gradle(?:\.kts)?|gradle(?:-wrapper)?\.properties|Cargo\.toml|rust-project\.json|go\.(?:mod|sum|work)|CMakeLists\.txt|compile_commands\.json|compile_flags\.txt|.*\.(?:csproj|sln|slnx|props|targets)|Package\.(?:swift|resolved)|composer\.json|Gemfile|pubspec\.(?:yaml|yml)|build\.sbt|\.clangd|\.classpath|\.project)$/.test(path.basename(file));
-}
-
-function* walk(dir: string, checkCancelled: () => void = () => {}, observeDirectory?: (dir: string) => void): Generator<string> {
-  checkCancelled();
-  observeDirectory?.(dir);
-  let entries: fs.Dirent[];
-  try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
-  for (const e of entries) {
-    checkCancelled();
-    if (SKIP_DIRS.has(e.name) || e.name.startsWith(".") && !isAnalysisControl(e.name)) continue;
-    const full = path.join(dir, e.name);
-    if (e.isDirectory()) yield* walk(full, checkCancelled, observeDirectory);
-    else if (e.isFile()) yield full;
-  }
-}
+export { CLASS_KINDS };

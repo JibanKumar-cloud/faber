@@ -4,6 +4,11 @@
  * is streaming so it never interleaves with model output. TTY only.
  */
 import pc from "picocolors";
+import { searchTerms } from "./indexer.js";
+
+export function probeGraph(text: string): string[] {
+  return searchTerms(text);
+}
 
 const FRAMES = ["✳", "✢", "✳", "✻"];
 

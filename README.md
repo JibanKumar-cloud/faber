@@ -37,7 +37,7 @@ That loop of task, approve, inspect, revert is the whole trust model. Everything
 
 ## Why Faber
 
-**Source-grounded code navigation.** The code graph uses installed language servers to connect calls to declaration locations across languages. `who_calls`, `calls_from`, `trace_path`, `graph_context`, and `/map` help locate relevant code. Same-named definitions have separate IDs. Saves record pending changes; analysis runs on an explicit graph request or once after two idle minutes. Ordinary task startup and saved-code search do not start analysis. `graph_changes` lists saved changes without running an analyzer. `graph_status` reports job phases, indexing timings, coverage and query timeouts without starting work. Task startup keeps a 200 ms foreground budget. Idle graph checks automatically extend the same in-flight verification up to one second when needed; checks during active indexing keep the short budget. This works without environment configuration. When freshness cannot be verified within the limit, the agent uses bounded current saved-text hints and call tools report that current bindings are unavailable. A query timeout does not prove indexing is still running. A ready graph supplies context ranked by the task's identifiers, paths and signatures, with resolved call neighbors. `/index` explicitly waits for a full build. Results describe static analysis, not proven execution; ambiguous and unresolved references stay visible and are excluded from paths. Without a compatible analyzer, Faber provides labeled heuristic search hints. See [code-graph behavior and limits](docs/code-graph.md).
+**It has a map, not just eyes.** The code graph knows every definition and every call in your repository, in every language, and is refreshed in milliseconds as files change. One ~50-token query (`trace_path(main, saveUser)` → `main → startServer → handleSignup → saveUser`) replaces reading thousands of tokens of files. Two functions with the same name are two different symbols: each call is linked to the one its scope, imports and types point at, and when the code itself doesn't say, the agent gets the candidates instead of a guess. `/map main` prints the call tree. See [how the code graph works](docs/code-graph.md).
 
 **Every model you can reach, including the coding ones.** Claude through the Anthropic API, your own AWS account, or Microsoft Foundry on Azure. OpenAI through both of its APIs — chat completions and the Responses API that the codex family requires — directly or through your Azure subscription. Plus anything OpenAI-compatible, and local models through Ollama for no key and no cost. Faber reads which endpoint each model needs and routes there itself, so `gpt-5.3-codex` and `claude-opus-5` are both just entries in the same list, priced side by side.
 
@@ -55,7 +55,7 @@ Faber is Codewright renamed, after the npm name was taken between building and r
 
 ## Requirements & install
 
-Faber needs **Node.js 22.5 or newer**. It uses Node's built-in SQLite, so there are no native dependencies to compile and installs don't fail on a missing toolchain. The only runtime dependencies are two small pure-JS packages.
+Faber needs **Node.js 22.5 or newer**. It uses Node's built-in SQLite and WebAssembly parsers, so there are no native dependencies to compile and installs don't fail on a missing toolchain. Runtime dependencies are four pure-JS/WASM packages: two small utilities, plus tree-sitter and its prebuilt grammars for the code graph (about 27 MB installed).
 
 Check your version:
 
@@ -141,7 +141,7 @@ Setup is skipped entirely when there's no terminal attached, so scripts and CI n
 | | |
 |---|---|
 | **Streaming agent loop** | Text renders as generated, with a live heartbeat (`✳ Working… 14s`) that never interleaves with output and ends in `✳ Worked for 14s`. Plan → tool → observe → adjust, until done. Hard iteration cap. |
-| **Code graph** | Qualified definitions and source-located static calls through optional local language servers. Cached file facts and atomic refreshes; no-change refresh does not re-run analysis. Compatible Pyright, JDT, Go, Rust and TS/JS native inventories narrow saved-edit refresh, including supported TS references, Go workspaces and Python environments. Python can reuse its native inventory for eligible body edits after checking saved syntax with an existing Python interpreter; optional first discovery runs in the background without delaying completed call results, and validated facts/inventories survive restarts. `graph_status.dependencyDiscovery` reports this cache preparation separately from query availability. Stock JDT cold analysis and unsupported configurations retain broad refresh. An opt-in Clang adapter narrows supported C/C++ body edits; its real-server release gate remains pending. Task context uses indexed lexical relevance plus bounded resolved call neighborhoods, with source locations and IDs. Complete dependency providers are supported in any language. Missing analyzers retain heuristic hints with path tracing disabled. Pinned large-repository capacity and scoped analyzer measurements are documented in [graph configuration and limits](docs/code-graph.md). |
+| **Code graph** | Definitions and call edges for 13 languages parsed with tree-sitter (TypeScript, JavaScript, Python, Go, Rust, Java, C, C++, C#, Ruby, PHP, Swift, Solidity) and a generic scanner for the rest (Kotlin, Scala, Dart, Lua and more). Symbol IDs like `src/store.ts#Store.save`; calls resolved by scope, imports, inheritance and declared types, each labelled with why. Agent tools: `search_code`, `who_calls` (blast radius), `calls_from` (dependencies), `trace_path` (call chain), `graph_context` (what matters for this task). Only changed files re-parse. Static analysis: dynamic dispatch and reflection aren't captured, so the agent reads code where precision matters. |
 | **Approval by default** | Arrow-key menu on every file edit (colored diff) and every shell command. `--auto` / `/auto` / `FABER_APPROVAL=auto` opts into autonomy. |
 | **Two OpenAI APIs** | Chat completions and the Responses API, chosen per model from the endpoint each one publishes. The codex family works without configuration. |
 | **Guided setup** | First run walks through vendor, route, credential and model, then remembers it. Later launches verify the setup can reach a model before opening the prompt. Nothing is saved until setup finishes, so an interrupted run leaves no half-configured state. |
@@ -312,8 +312,7 @@ Flags: `faber [task] [--workspace|-w <dir>] [--resume] [--ask|--auto] [--version
 | `FABER_MAX_ITERATIONS` | loop cap (40) |
 | `FABER_CONTEXT_BUDGET` | compaction threshold, tokens (60000) |
 | `FABER_SHELL_TIMEOUT` | ms (120000) |
-| `FABER_GRAPH_IDLE_MS` | graph idle fallback in ms (120000); `off` disables idle analysis; explicit graph requests still refresh |
-| `FABER_GRAPH_FOREGROUND_MS` | optional fixed check budget in ms (20–1000); unset uses automatic idle checks from 200 up to 1000 ms |
+| `FABER_GRAPH_MAX_FILES` | most source files the code graph will index (20000) |
 | `FABER_ROUTE`, `FABER_REGION` | route id and region, overriding the profile |
 | `FABER_AUTO_PRICES` | `0` disables the background price refresh |
 | `BEDROCK_API_KEY` | Bedrock, when you'd rather use a key than an IAM role |
@@ -367,7 +366,8 @@ Agent loop (agent.ts) recall memory + repo map → [LLM ⇄ tools] → verify �
    ├─ Routes (routes.ts)      vendor → route → model · SigV4 for Bedrock (sigv4.ts) · live model discovery
    ├─ Pricing (pricing.ts)    per-model rates, modes and endpoints · conditional refresh · frozen at spend
    ├─ Tools (tools/)          validated dispatch · mutations staged as diffs · shell gated by approval
-   ├─ Graph (indexer.ts)      symbols + call/import edges · incremental · who_calls / trace_path / map
+   ├─ Graph (indexer.ts,      tree-sitter parse → scope/import/type resolution → SQLite · incremental
+   │        graph/)           search_code / who_calls / calls_from / trace_path / graph_context / map
    ├─ Memory (memory/)        shortTerm (window+compaction) · longTerm (SQLite+FTS) · sessions (JSONL)
    └─ Checkpoints             snapshot-before-write · /history · reversible restore
 

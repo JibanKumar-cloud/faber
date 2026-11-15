@@ -128,35 +128,31 @@ test("e2e: streamed multi-turn task edits a file, verifies, persists session", a
   await agent.close();
 });
 
-test("e2e: task graph context follows the task and leaves the repository prompt map stable", async t => {
+test("e2e: each task gets graph context for its own words; graph tools answer from saved files", async t => {
   const srv = await mockServer([{ text: "Payment checked." }, { text: "Report checked." }]);
   const cfg = tmpConfig(srv.url), agent = new Agent(cfg, async () => true);
   t.after(async () => { srv.close(); await agent.close(); fs.rmSync(cfg.workspace, { recursive: true, force: true }); });
   fs.writeFileSync(path.join(cfg.workspace, "payments.py"), "def process_payment():\n    return 1\n");
-  fs.writeFileSync(path.join(cfg.workspace, "reports.py"), "def generate_report():\n    return 2\n");
-  await agent.indexer.build();
-  let mapCalls = 0;
-  const current = agent.indexer.current.bind(agent.indexer);
-  agent.indexer.current = async (...args) => {
-    const result = await current(...args);
-    if (result.status === "ready" && args[0] === "prompt" && typeof result.value === "object" && "map" in result.value && result.value.map !== undefined) mapCalls++;
-    return result;
-  };
+  fs.writeFileSync(path.join(cfg.workspace, "reports.py"), "from payments import process_payment\n\ndef generate_report():\n    return process_payment()\n");
   await agent.runTask("Check process_payment");
   await agent.runTask("Check generate_report");
   const [first, second] = srv.bodies();
   const context = (body: any) => body.messages.filter((m: any) => m.role === "user").at(-1).content
-    .find((block: any) => block.text?.startsWith("Task-specific code context:"))?.text;
-  assert.match(context(first), /payments.py:1 process_payment/);
-  assert.doesNotMatch(context(first), /generate_report/);
-  assert.match(context(second), /reports.py:1 generate_report/);
-  assert.doesNotMatch(context(second), /process_payment/);
-  assert.doesNotMatch(JSON.stringify(first.system), /Task-specific code context:/);
-  assert.doesNotMatch(JSON.stringify(second.system), /Task-specific code context:/);
-  assert.equal(mapCalls, 1, "the unchanged generation reuses its repository prompt map");
+    .find((block: any) => block.text?.startsWith("Relevant definitions from the code graph"))?.text;
+  assert.match(context(first), /payments\.py#process_payment/);
+  assert.match(context(second), /reports\.py#generate_report/);
+  assert.ok(context(second).indexOf("generate_report") < context(second).indexOf("process_payment"), "the task's own words rank first; its callee follows");
+  // The system prompt carries the repo map, never the per-task context.
+  assert.match(JSON.stringify(first.system), /process_payment \[function\] payments\.py:1 \(1 call\)/);
+  assert.doesNotMatch(JSON.stringify(first.system), /Relevant definitions from the code graph/);
   const tool = await agent.tools.execute("graph_context", { query: "generate_report", token_budget: 250 });
-  assert.equal(tool.isError, false); assert.match(tool.output, /reports.py:1 generate_report/);
+  assert.equal(tool.isError, false); assert.match(tool.output, /reports\.py#generate_report/);
   assert.ok(Buffer.byteLength(tool.output) <= 750);
+  // A file written after the last refresh is visible to the next graph tool call.
+  fs.writeFileSync(path.join(cfg.workspace, "audit.py"), "from payments import process_payment\n\ndef audit():\n    process_payment()\n");
+  const callers = await agent.tools.execute("who_calls", { name: "process_payment" });
+  assert.match(callers.output, /audit\.py:4 {2}audit {2}\[import\]/);
+  assert.match(callers.output, /reports\.py:4 {2}generate_report {2}\[import\]/);
 });
 
 test("e2e: doom-loop breaker aborts after 3 identical failing calls", async () => {

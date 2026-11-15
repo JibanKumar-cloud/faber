@@ -120,10 +120,14 @@ export class FsTools {
     };
   }
 
-  /** Exact, unique string replacement — staged for approval like stageWrite. */
-  stageEdit(p: string, oldStr: string, newStr: string): PendingWrite {
+  /**
+   * Exact string replacement, staged for approval like stageWrite. old_str must match once,
+   * unless replaceAll is set, in which case every occurrence changes in one reviewed diff.
+   */
+  stageEdit(p: string, oldStr: string, newStr: string, replaceAll = false): PendingWrite {
     const abs = resolveInWorkspace(this.config.workspace, p);
     if (!fs.existsSync(abs)) throw new ToolError(`File not found: ${p}`);
+    if (!oldStr) throw new ToolError("old_str is empty. Give the exact text to replace.");
     const text = fs.readFileSync(abs, "utf8");
     const count = text.split(oldStr).length - 1;
     if (count === 0) {
@@ -131,10 +135,11 @@ export class FsTools {
         "old_str not found in file. Re-read the file — it may have changed, or your string may not match exactly (check whitespace).",
       );
     }
-    if (count > 1) {
-      throw new ToolError(`old_str appears ${count} times; it must be unique. Include more surrounding context.`);
+    if (count > 1 && !replaceAll) {
+      throw new ToolError(`old_str appears ${count} times. Include more surrounding context to pick one, or pass replace_all=true to change all ${count}.`);
     }
-    const after = text.replace(oldStr, newStr);
+    // split/join, not String.replace: "$1" or "$&" in new_str must stay literal text.
+    const after = text.split(oldStr).join(newStr);
     const diff = createTwoFilesPatch(p, p, text, after, "before", "after");
     return {
       path: p,
@@ -145,7 +150,7 @@ export class FsTools {
         if (current !== text) throw new ToolError(`${p} changed since the edit was staged; re-read and retry.`);
         this.checkpoints.snapshot(abs);
         atomicWrite(abs, after);
-        return `Edited ${p} (1 replacement).`;
+        return `Edited ${p} (${count} replacement${count === 1 ? "" : "s"}).`;
       },
     };
   }
